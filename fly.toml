@@ -1,0 +1,60 @@
+# Fly.io configuration for the Sarang gateway.
+#
+# Deploy from the repository root:
+#   fly launch --no-deploy --copy-config --name sarang-gateway
+#   fly secrets set SESSION_SECRET=... SARVAM_API_KEY=... GEMINI_API_KEY=...
+#   fly deploy
+#
+# `bom` (Mumbai) is the default because the audience is in India; see ADR 0002.
+# WebRTC and the WebSocket PCM fallback both ride this single HTTP service.
+
+app = "sarang-gateway"
+# `bom` (Mumbai) preferred for India, but not available on this Fly account; using `sin`.
+primary_region = "sin"
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[build]
+  dockerfile = "apps/api/Dockerfile"
+
+[env]
+  SARANG_PROFILE = "bom-india"
+  # WebRTC needs a TURN server to work behind Fly's private networking; with
+  # STUN only, every visitor pays a failed ICE before falling back to the
+  # WebSocket PCM path. Until TURN exists, go straight to the transport that
+  # actually connects. Flip back to "true" once TURN_SHARED_SECRET is set.
+  ENABLE_WEBRTC = "false"
+  ALLOWED_ORIGINS = "https://sanket--sonwane.vercel.app"
+  # 800 ms of silence ends a turn. 500 ms closed turns mid-sentence on Indian
+  # accented speech; the pre-roll buffer makes the extra wait invisible.
+  ENDPOINT_SILENCE_MS = "800"
+  LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 200
+    hard_limit = 250
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "1gb"
+
+[checks.health]
+  grace_period = "10s"
+  interval = "15s"
+  method = "get"
+  path = "/healthz"
+  timeout = "2s"
+  type = "http"
+
+[[mounts]]
+  source = "sarang_cache"
+  destination = "/app/cache"
