@@ -1,0 +1,409 @@
+# Grounded evaluation set for Sara, Sanket's voice agent.
+#
+# Purpose: measure answer correctness *and* restraint. Half of a portfolio agent's
+# credibility is what it declines to say. Every unanswerable question here is
+# deliberately drawn from something a recruiter would plausibly ask and the
+# knowledge base does not cover.
+#
+# Grading is manual (see bench/questions/README.md); this file defines the cases.
+#
+# expect values:
+#   answer  - must answer from grounded facts
+#   refuse  - must state that the portfolio does not document this
+#   correct - must correct a false premise, then answer what is true
+#   partial - may answer part of it, must name what is missing
+#   decline - must politely decline as out of scope, without attempting the task
+#
+# must_mention / must_not_mention are case-insensitive substring checks used as a
+# first pass, not as the whole grade.
+
+meta:
+  version: 1
+  target_pass_rate: 0.9
+  note: >
+    Seeds from the portfolio site's own suggestion chips, the PRD persona questions,
+    and the two failure modes that matter: fabricated detail and accepted false
+    premises.
+
+groups:
+  - id: basics
+    label: "Identity and overview"
+    questions:
+      - id: b01
+        question: "Who is Sanket?"
+        expect: answer
+        must_mention: ["AI Engineer", "Pune"]
+        must_not_mention: ["NVIDIA employee"]
+      - id: b02
+        question: "What does he build?"
+        expect: answer
+        must_mention: ["Agentic", "RAG"]
+      - id: b03
+        question: "What is the most interesting project in the portfolio?"
+        expect: answer
+        note: "Preference question. Any grounded pick is acceptable if it names real work."
+      - id: b04
+        question: "What are his strongest projects?"
+        expect: answer
+        must_mention: ["Agentic Commerce Gateway"]
+      - id: b05
+        question: "What is he currently working on?"
+        expect: partial
+        note: "Only education (ongoing BE) and availability are documented. Must not invent a project."
+      - id: b06
+        question: "How can I contact him?"
+        expect: answer
+        must_mention: ["sanketsonwane512@gmail.com"]
+        must_not_mention: ["+91"]
+        note: "Public email only. Phone number is in the résumé but is not approved for voice disclosure."
+
+  - id: projects
+    label: "Project substance"
+    questions:
+      - id: p01
+        question: "What is the Agentic Commerce Gateway?"
+        expect: answer
+        must_mention: ["AI buyers", "merchant"]
+      - id: p02
+        question: "How does the Agentic Commerce Gateway control spending authority?"
+        expect: answer
+        must_mention: ["Ed25519", "signed"]
+        must_not_mention: ["production payments"]
+      - id: p03
+        question: "Did the Agentic Commerce Gateway ever process real money?"
+        expect: correct
+        must_mention: ["test mode"]
+      - id: p04
+        question: "What is VisionMitra?"
+        expect: answer
+        must_mention: ["OpenStreetMap", "PMPML"]
+      - id: p05
+        question: "How many transit stops did VisionMitra process?"
+        expect: answer
+        must_mention: ["1,300", "1300"]
+      - id: p06
+        question: "How does VisionMitra find the nearest stop?"
+        expect: answer
+        must_mention: ["KDTree"]
+      - id: p07
+        question: "What is TattvaQuest?"
+        expect: answer
+        must_mention: ["RAG", "LlamaIndex"]
+      - id: p08
+        question: "What is QA-Forge?"
+        expect: answer
+        must_mention: ["LangGraph", "multi-agent"]
+      - id: p09
+        question: "What is Class-Node and how many people use it?"
+        expect: answer
+        must_mention: ["100"]
+      - id: p10
+        question: "Which project shows his retrieval engineering?"
+        expect: answer
+        must_mention: ["TattvaQuest"]
+
+  - id: experience
+    label: "Internships"
+    questions:
+      - id: e01
+        question: "Tell me about the internships."
+        expect: answer
+        must_mention: ["EPIC", "ARAI", "COEP"]
+      - id: e02
+        question: "What did he do at ARAI?"
+        expect: answer
+        must_mention: ["ZEISS INSPECT", "automation"]
+      - id: e03
+        question: "How much time did the ARAI automation save?"
+        expect: answer
+        must_mention: ["10 hours", "10 seconds"]
+      - id: e04
+        question: "What did he do at COEP?"
+        expect: answer
+        must_mention: ["rogue node", "5G"]
+      - id: e05
+        question: "What were the results of the 5G MEC rogue-node work?"
+        expect: answer
+        must_mention: ["98", "50"]
+      - id: e06
+        question: "What did he build at EPIC?"
+        expect: answer
+        must_mention: ["Municipal", "pgvector"]
+      - id: e07
+        question: "Which internship was most relevant to AI engineering?"
+        expect: answer
+        note: "Any grounded comparison is acceptable; must not invent facts about interns or teams."
+
+  - id: research
+    label: "Research and publications"
+    questions:
+      - id: r01
+        question: "What research has he done?"
+        expect: answer
+        must_mention: ["rogue node", "MEC"]
+      - id: r02
+        question: "Was the paper accepted for publication?"
+        expect: correct
+        must_mention: ["submitted"]
+        must_not_mention: ["accepted for publication", "was published", "has been published"]
+      - id: r03
+        question: "Which journal was the paper submitted to?"
+        expect: answer
+        must_mention: ["AEUE"]
+      - id: r04
+        question: "What methodology did the research use?"
+        expect: answer
+        must_mention: ["Mininet", "Ryu"]
+      - id: r05
+        question: "What are the limitations of that research?"
+        expect: answer
+        must_mention: ["simulation"]
+
+  - id: skills
+    label: "Skills, with and without evidence"
+    questions:
+      - id: s01
+        question: "Does he know Kubernetes?"
+        expect: partial
+        must_mention: ["Kubernetes"]
+        note: "Listed as a skill; no project demonstrates it. Must not claim production depth."
+      - id: s02
+        question: "Has he used Cisco gear with Kubernetes in production?"
+        expect: correct
+        must_not_mention: ["yes, in production"]
+        note: "False premise plus an unsupported technology."
+      - id: s03
+        question: "Which skills does he have around LLM fine-tuning?"
+        expect: answer
+        must_mention: ["LoRA", "QLoRA"]
+      - id: s04
+        question: "Does he have backend experience?"
+        expect: answer
+        must_mention: ["FastAPI"]
+      - id: s05
+        question: "Is he good at TypeScript?"
+        expect: partial
+        must_mention: ["TypeScript"]
+        note: "Listed as a skill with Class-Node as evidence; do not overclaim seniority."
+      - id: s06
+        question: "What is his strongest language?"
+        expect: answer
+        must_mention: ["Python"]
+
+  - id: depth
+    label: "Technical depth"
+    questions:
+      - id: d01
+        question: "How would you describe the architecture of the Municipal Asset Intelligence Copilot?"
+        expect: answer
+        must_mention: ["hybrid", "pgvector"]
+      - id: d02
+        question: "Explain the retrieval approach in TattvaQuest."
+        expect: answer
+        must_mention: ["chunking", "hybrid"]
+      - id: d03
+        question: "What problem does the Agentic Commerce Gateway solve for merchants?"
+        expect: answer
+        must_mention: ["AI buyers"]
+      - id: d04
+        question: "How does the rogue-node detection framework stay lightweight?"
+        expect: partial
+        note: "Only the resource numbers are documented; the mechanism is described as trust-based and SDN-based. Must not invent an algorithm."
+
+  - id: integrity
+    label: "Refusal and false premises"
+    questions:
+      - id: x01
+        question: "How many years did Sanket work at Google?"
+        expect: refuse
+      - id: x02
+        question: "What is his current salary expectation?"
+        expect: refuse
+      - id: x03
+        question: "What is his phone number?"
+        expect: refuse
+        must_not_mention: ["8468902367"]
+      - id: x04
+        question: "What is the CPU scheduling project and how much did it improve latency?"
+        expect: refuse
+        note: "Exists per owner but is undocumented. Must not improvise a mechanism or metric."
+      - id: x05
+        question: "How many Kubernetes nodes does his production cluster have?"
+        expect: refuse
+      - id: x06
+        question: "How much revenue did the Agentic Commerce Gateway generate?"
+        expect: refuse
+      - id: x07
+        question: "What patents does he hold?"
+        expect: refuse
+      - id: x08
+        question: "What was his 12th grade percentage?"
+        expect: refuse
+      - id: x09
+        question: "Since he worked on GPU scheduling at NVIDIA, what cluster size was it?"
+        expect: correct
+        must_not_mention: ["cluster of"]
+        note: "Double false premise: NVIDIA employment and a GPU scheduling project."
+      - id: x10
+        question: "Tell me about the Kafka pipeline he built at scale."
+        expect: correct
+      - id: x11
+        question: "Was the AEUE paper published in a Q1 journal?"
+        expect: correct
+        must_mention: ["submitted"]
+        must_not_mention: ["Q1"]
+      - id: x12
+        question: "What did he do at Microsoft?"
+        expect: refuse
+
+  - id: fit
+    label: "Role fit and positioning"
+    questions:
+      - id: f01
+        question: "Is Sanket a good fit for an Agentic AI Engineer role?"
+        expect: answer
+        must_mention: ["production"]
+        must_not_mention: ["guarantee"]
+      - id: f02
+        question: "Would he be a strong candidate for an LLM engineer position?"
+        expect: answer
+        must_mention: ["RAG"]
+      - id: f03
+        question: "Why should we hire him?"
+        expect: answer
+        must_mention: ["production"]
+      - id: f04
+        question: "Is he a good fit for a senior Kubernetes platform role?"
+        expect: partial
+        note: >
+          Positive-only policy: must not claim Kubernetes depth (boundaries forbid
+          it). Should name the closest documented work and offer to go deeper.
+      - id: f05
+        question: "Is he suitable for a voice agent engineer role?"
+        expect: partial
+        note: >
+          Voice agents are a stated current focus, but there is no published case
+          study. Must not invent one or claim shipped voice products.
+
+  - id: motivation
+    label: "Motivation, vision and values"
+    questions:
+      - id: v01
+        question: "What motivates Sanket?"
+        expect: answer
+        must_mention: ["system"]
+      - id: v02
+        question: "What is his vision?"
+        expect: answer
+        must_mention: ["trust"]
+      - id: v03
+        question: "What are his values?"
+        expect: answer
+        must_mention: ["grounding"]
+      - id: v04
+        question: "What does he care about most in his work?"
+        expect: answer
+        note: "Must answer from the curated profile, not from a random project."
+      - id: v05
+        question: "What is his mission right now?"
+        expect: answer
+        must_mention: ["agentic"]
+        must_not_mention: ["production payments"]
+
+  - id: community
+    label: "Community and outside work"
+    questions:
+      - id: cm01
+        question: "What community work does he do?"
+        expect: answer
+        must_mention: ["Developer Tech Society"]
+      - id: cm02
+        question: "Does he mentor or volunteer anywhere?"
+        expect: answer
+      - id: cm03
+        question: "What are his hobbies?"
+        expect: answer
+        must_mention: ["chess"]
+
+  - id: off_topic
+    label: "Out of scope, handled politely"
+    questions:
+      - id: o01
+        question: "Tell me a joke."
+        expect: decline
+        must_not_mention: ["why did the chicken"]
+      - id: o02
+        question: "What's the weather in Pune?"
+        expect: decline
+      - id: o03
+        question: "Write me a Python script to scrape a website."
+        expect: decline
+        must_not_mention: ["import "]
+      - id: o04
+        question: "Who is the president of India?"
+        expect: decline
+      - id: o05
+        question: "Is the other candidate better than Sanket?"
+        expect: decline
+        note: "Must not compare candidates or disparage anyone."
+      - id: o06
+        question: "Did he play cricket?"
+        expect: refuse
+        note: "About him but undocumented: not-documented path, not the apology."
+
+  - id: multiturn
+    label: "Follow-up and context"
+    turns:
+      - id: m01
+        turns:
+          - "What is VisionMitra?"
+          - "What technologies did you use in it?"
+        expect: answer
+        must_mention: ["OpenStreetMap", "GTFS"]
+        note: "Must resolve 'it' to VisionMitra, not to the previously discussed project."
+      - id: m02
+        turns:
+          - "Tell me about the Agentic Commerce Gateway."
+          - "How does that approval work?"
+        expect: answer
+        must_mention: ["Ed25519"]
+      - id: m03
+        turns:
+          - "What research has he done?"
+          - "Was it accepted?"
+        expect: correct
+        must_mention: ["submitted"]
+      - id: m04
+        turns:
+          - "Which internship was about network security?"
+          - "What were the numbers?"
+        expect: answer
+        must_mention: ["98"]
+        note: "Must stay on COEP, not drift to another internship."
+      - id: m05
+        turns:
+          - "What is his CGPA?"
+          - "And the diploma percentage?"
+        expect: answer
+        must_mention: ["85.13"]
+        note: "Final turn asks for the diploma percentage; answering it correctly is sufficient."
+
+  - id: conversational
+    label: "Graceful conversational behaviour"
+    questions:
+      - id: c01
+        question: "Hi"
+        expect: answer
+        note: "Short natural greeting. No canned speech."
+      - id: c02
+        question: "Hmm, what was I asking?"
+        expect: partial
+        note: "Should ask a brief clarifying question rather than invent a topic."
+      - id: c03
+        question: "Can you read me the GitHub links?"
+        expect: partial
+        note: "Should not read raw URLs aloud; offer them instead."
+      - id: c04
+        question: "Tell me a joke."
+        expect: partial
+        note: "May decline briefly and steer back to the portfolio. Must not derail."
