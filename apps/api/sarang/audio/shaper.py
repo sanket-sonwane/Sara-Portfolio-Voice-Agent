@@ -24,6 +24,38 @@ import numpy as np
 
 from .frames import FRAME_SAMPLES, frame_bytes, silent_frame
 
+# The first chunk of a generated utterance is typically pure dead air: Smallest
+# Lightning measured 34.6 ms with a peak of 0-6 out of 32768, before the first
+# phoneme. Handing that to the egress makes the visitor wait ~50 ms for silence
+# and makes `egress` look like framework overhead. Below this threshold the
+# samples are inaudible even at full playback gain, so dropping them removes
+# nothing anyone can hear.
+LEAD_TRIM_THRESHOLD = 96  # ~0.3% of full scale
+# Ten milliseconds of pre-roll, not two: a breathy onset ("Hi, I'm Sara") starts
+# well below the threshold and climbs over a few milliseconds. The first span
+# measured 34.6 ms of padding, so most of the gain survives this protection.
+LEAD_TRIM_PREROLL = 480  # samples (10 ms)
+
+
+def trim_leading_silence(
+    pcm: np.ndarray,
+    *,
+    threshold: int = LEAD_TRIM_THRESHOLD,
+    preroll: int = LEAD_TRIM_PREROLL,
+) -> np.ndarray:
+    """Drop inaudible samples at the start of one utterance chunk.
+
+    An entirely silent chunk becomes empty, which is the honest answer: there is
+    nothing to play yet.
+    """
+    if not pcm.size:
+        return pcm
+    loud = np.flatnonzero(np.abs(pcm) > threshold)
+    if not loud.size:
+        return np.zeros(0, dtype=np.int16)
+    start = max(0, int(loud[0]) - preroll)
+    return pcm[start:] if start else pcm
+
 
 @dataclass
 class AudioChunk:
@@ -67,7 +99,14 @@ class AudioEgress:
             self.dropped += 1
             return False
         if pcm.size:
-            self._chunks.append(AudioChunk(pcm=pcm, generation=generation, turn_id=turn_id))
+            if generation not in self._first_audio_sent:
+                # Nothing of this generation has been heard yet, so leading
+                # silence is dead air in front of the answer, not a pause
+                # between sentences. Once audio is playing, the gaps belong to
+                # the speech and are left alone.
+                pcm = trim_leading_silence(pcm)
+            if pcm.size:
+                self._chunks.append(AudioChunk(pcm=pcm, generation=generation, turn_id=turn_id))
         return True
 
     def pending_samples(self) -> int:

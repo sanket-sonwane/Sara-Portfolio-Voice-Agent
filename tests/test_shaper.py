@@ -138,6 +138,66 @@ async def test_after_the_first_frame_one_frame_is_not_enough_to_pace():
     assert egress.underruns == 1
 
 
+def test_trim_drops_inaudible_lead_but_keeps_a_preroll():
+    from sarang.audio.shaper import trim_leading_silence
+
+    chunk = np.concatenate([pcm(4_000, 0), pcm(1_000)])
+    trimmed = trim_leading_silence(chunk)
+
+    # 480 samples (10 ms) of pre-roll survive so a soft onset is not clipped.
+    assert trimmed.size == chunk.size - (4_000 - 480)
+    assert trimmed[0] == 0 and trimmed[480] == 1_000
+
+
+def test_trim_leaves_a_chunk_that_starts_loud_alone():
+    from sarang.audio.shaper import trim_leading_silence
+
+    chunk = pcm(1_000)
+    assert trim_leading_silence(chunk) is chunk
+
+
+def test_trim_drops_a_wholly_silent_chunk():
+    from sarang.audio.shaper import trim_leading_silence
+
+    assert trim_leading_silence(pcm(2_000, 0)).size == 0
+    assert trim_leading_silence(np.zeros(0, dtype=np.int16)).size == 0
+
+
+async def test_first_chunk_loses_leading_dead_air():
+    """The TTS puts ~35 ms of silence before the first phoneme; it is not audio."""
+    from sarang.audio.frames import FRAME_SAMPLES as samples_per_frame
+
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(np.concatenate([pcm(samples_per_frame * 2, 0), pcm(samples_per_frame)]), 1, "trn_1")
+
+    # 2 880 samples queued; the first 1 920 are silent and 480 stay as pre-roll.
+    assert egress.pending_samples() == 2_880 - (1_920 - 480)
+
+    frame = await egress.next_frame()
+    assert frame.any()
+
+
+async def test_a_silent_first_chunk_is_dropped_entirely():
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(pcm(1_660, 0), 1, "trn_1")
+
+    assert egress.pending_samples() == 0
+    assert not (await egress.next_frame()).any()
+
+
+async def test_pauses_after_audio_has_started_are_preserved():
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(pcm(1_920), 1, "trn_1")
+    assert (await egress.next_frame()).any()
+
+    before = egress.pending_samples()
+    egress.put(pcm(960, 0), 1, "trn_1")
+    assert egress.pending_samples() == before + 960
+
+
 async def test_underrun_is_counted_and_silent():
     egress = AudioEgress()
     egress.set_generation(1)
