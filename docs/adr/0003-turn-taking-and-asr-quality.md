@@ -1,0 +1,150 @@
+# ADR 0003 — Turn-taking and recognition quality
+
+**Date:** 2026-11-10
+**Status:** accepted
+**Context:** the first live user test of `bom-india` produced transcripts that
+were a *fragment* of the sentence, with the first few words and some middle
+words garbled, and Sara began answering while the visitor was still talking. The
+target is WER < 6%. This ADR records what was actually wrong and why the fixes
+are shaped the way they are.
+
+---
+
+## 1. Endpointing is owned by the gateway, and it was too eager
+
+**Decision.** Silence to end a turn is **800 ms**, minimum speech **120 ms**,
+hangover **250 ms**, and the last **800 ms** of audio is kept as a pre-roll ring
+buffer and replayed when speech starts.
+
+**Why.** The previous 500 ms window with a 140 ms hangover treated the tail of a
+word, or a breath, as the end of the turn. That produces exactly the reported
+symptom: a transcript that is a fragment, and an answer that starts over the
+visitor. Indian-accented English has longer closure and more breath than the
+corpora the default was tuned on.
+
+The 120 ms minimum used to *discard* the audio that triggered the VAD, so the
+first syllable of every question was never sent to the recogniser. The pre-roll
+buffer is what makes a longer silence window free: nothing is lost at the start
+of the next utterance, so the extra wait only costs the 800 ms itself.
+
+**Trade-off.** Every turn pays 800 ms before the recogniser is told the turn
+ended. That is the correct place to spend latency: answering a fragment costs a
+whole extra turn.
+
+## 2. One recogniser socket per connection, not one per utterance
+
+**Decision.** The ASR WebSocket is opened when the transport opens
+(`UtteranceLoop.warm()`) and reused for every turn on that connection. Turns are
+delimited with `speech_start` / `speech_end`.
+
+**Why.** Opening a socket on speech start spends a 200–400 ms handshake at the
+exact moment the visitor begins talking, and forces a second buffer to guess
+what was missed. A warm socket also means the provider's `session.begin` has
+already been validated before audio arrives.
+
+`session.begin` echoes the resolved `sample_rate`, `encoding` and
+`turn_detection`. We assert them: "we asked for 16 kHz" and "the server is
+decoding 16 kHz" are different claims, and only the second one keeps audio
+intelligible.
+
+## 3. The answer is built from `transcript.final` only
+
+**Decision.** `transcript.partial` drives the live transcript. The turn engine
+runs on `transcript.final`. A partial is used only after
+`ASR_FINAL_TIMEOUT_S` (3.5 s) and the fallback is logged.
+
+**Why.** Partials are unstable by construction: on the same fixture, one partial
+came back in Devanagari for an English session while the final was correct
+English. Answering from a partial is answering a sentence the visitor did not
+finish saying. `flush` was also removed: `speech_end` already finalises, and
+sending both could truncate the final.
+
+Partial events whose script does not match the session language are dropped
+before they reach the UI — a stray partial only ever costs credibility on
+screen.
+
+## 4. Resample once, on the server, with a stateful filter
+
+**Decision.** The browser captures at the device's native rate and sends that
+rate as `sr`. The gateway resamples once per connection with `StreamResampler`
+(soxr HQ). The browser-side `LinearResampler` is gone from the microphone path.
+
+**Why.** The old path decimated 48 kHz → 16 kHz with no anti-alias filter, so
+sibilants folded back into the formant band; the recogniser heard noise where
+the consonants were. It also duplicated one sample at every block boundary. A
+stateful resampler is required because per-chunk resampling discards filter
+state at each boundary — fifty clicks a second.
+
+## 5. Keyterms are rationed; the prompt is not
+
+**Decision.** At most **12** keyterms: three priority acronyms (`ARAI`, `AEUE`,
+`ZEISS INSPECT`) plus project names. Spelled-out sequences (`"A E U E"`) and any
+term containing a comma or semicolon are excluded. The domain `prompt` is always
+sent.
+
+**Why.** Measured against the live endpoint on the fixture clip "what did Sanket
+build during the ARAI internship":
+
+| keyterms sent | transcript |
+|---|---|
+| none | "ARII" (3/3) |
+| 1–3 acronyms (+ projects) | "ARAI" (6/6) |
+| 7 acronyms | "ARII" (2/2) |
+| 20 terms, acronym-heavy | "AAI" (4/4) |
+
+Keyterms help only while the acronym set stays small: past a handful the
+candidates compete and the decoder lands on a *different* plausible acronym.
+Project names are free because they are not confusable with each other, so only
+the acronyms are rationed. A comma in one term is worse still — the provider
+rejects the whole session with a fatal `invalid_request`.
+
+## 6. Known mis-hearings are repaired in the transcript, deterministically
+
+**Decision.** `lexicon.misheard` in `kb/fact.yaml` maps observed variants
+(`ARII`, `AAI`, `AII`, `ARI`, `A R A I`) to the canonical spelling, applied to
+every transcript by `asr/normalize.py`.
+
+**Why.** Biasing is probabilistic; a visitor reading "the AAI internship"
+concludes the system is broken even when the answerer resolved the entity
+correctly. The table is small and curated, not a spell checker: rewriting words
+that are not in the table is worse than a visible mis-transcription.
+
+## 7. Cartesia contexts are bounded to the account's concurrency
+
+**Decision.** `TTS_MAX_CONCURRENCY` (default 2) caps concurrent Cartesia
+contexts.
+
+**Why.** The orchestrator submits every answer segment at once, so a
+three-sentence answer opened three contexts against an account limit of two and
+silently fell back to the synthetic voice mid-answer. Synthesis runs ~11x faster
+than playback, so the bound costs no latency: the next segment is ready long
+before it is heard.
+
+## 8. Measured result
+
+Through the real gateway over `/ws/audio`, 2 turns on the fixture clip:
+
+| metric | value |
+|---|---|
+| transcript | correct (2/2) |
+| ASR finalise (p50) | 592 ms |
+| LLM TTFT (p50) | 418 ms |
+| TTS TTFA (p50) | 93 ms |
+| EOS → first answer audio (p50) | 1,123 ms |
+
+ASR finalisation is now the largest single stage, which is the expected
+consequence of waiting for a real final instead of accepting a partial.
+
+## 9. Not done, deliberately
+
+* **Silero VAD.** The energy VAD is adequate once endpointing is generous. A
+  learned VAD would let the silence window drop back towards 500 ms without
+  clipping, and is the next quality step.
+* **REST hybrid finalizer.** Re-running the utterance through `/speech-to-text`
+  after `speech_end` would likely beat the streaming final on accuracy at the
+  cost of ~700 ms. Worth measuring before adopting.
+* **TURN for WebRTC.** With STUN only, Fly gives private `fdaa:` candidates and
+  ICE fails, so `ENABLE_WEBRTC=false` in `fly.toml` until a TURN server exists.
+  WebRTC's Opus and jitter buffer are worth having, but not at the cost of every
+  visitor paying a failed ICE before the WebSocket fallback connects.
+
