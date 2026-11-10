@@ -56,6 +56,18 @@ class TurnMarks:
         self.stage_exit[stage] = now()
         return (self.stage_exit[stage] - start) * 1000.0
 
+    def exit_open(self, stage: str) -> float | None:
+        """Close a stage only if it is open.
+
+        A stage that was never entered has no start, and ``exit`` would silently
+        measure it from the turn origin, which reports a plausible-looking but
+        meaningless number. Callers that may or may not have opened a stage use
+        this instead.
+        """
+        if stage not in self.stage_enter or stage in self.stage_exit:
+            return None
+        return self.exit(stage)
+
     def mark_first_audio(self) -> float:
         if self.first_audio is None:
             self.first_audio = now()

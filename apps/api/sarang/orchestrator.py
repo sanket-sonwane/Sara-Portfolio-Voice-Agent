@@ -133,6 +133,11 @@ class OrderedSpeech:
         self._contexts.append(context_id)
         if not self._submitted:
             self._submitted = True
+            # The first segment reaching TTS is the end of segmentation. It used
+            # to be closed after the whole model stream finished, which reported
+            # "the rest of the generation" under the name of the stage that
+            # decides when speech can start.
+            self.marks.exit_open("segment")
             self.marks.enter("tts_ttfa")
         self._tasks[index] = asyncio.create_task(self._synthesize(index, text, context_id, queue))
         self._inbox.put_nowait(index)
@@ -225,7 +230,6 @@ class TurnRuntime:
     segments: list[str] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
     first_token: bool = False
-    first_segment: bool = False
     filler_used: bool = False
     llm_started: float = 0.0
     spoken_words: int = 0
@@ -615,9 +619,6 @@ class Orchestrator:
         if not answer.strip():
             answer, _ = await self._stream_fallback(runtime, text, result, chunks)
 
-        if runtime.first_segment:
-            runtime.marks.exit("segment")
-
         await runtime.speech.finish()
 
         if session.generation != generation:
@@ -773,7 +774,6 @@ class Orchestrator:
             return
         runtime.spoken_words += words
         runtime.segments.append(segment)
-        runtime.first_segment = True
         runtime.speech.submit(segment)
 
     async def _retrieve(self, runtime: TurnRuntime, text: str) -> list[Chunk]:

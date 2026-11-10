@@ -135,6 +135,39 @@ async def test_greeting_is_spoken_once(orchestrator, session):
         assert queue.get_nowait().type.value != "assistant.final"
 
 
+async def test_segment_mark_measures_the_wait_for_the_first_spoken_segment(
+    orchestrator, session, monkeypatch
+):
+    """`segment` is "first token → first segment at TTS", not the whole stream.
+
+    The old mark was closed after the model finished, so it silently reported
+    the rest of the generation under the name of the stage that decides when
+    speech can start.
+    """
+    from sarang.llm.base import Done, TextDelta
+
+    async def slow_tail(text, result, chunks=None, **kwargs):
+        yield TextDelta("Sara built the ARAI tool. It ran")
+        await asyncio.sleep(0.4)
+        yield TextDelta(" for about ten hours in Pune.")
+        yield Done(usage={"provider": "test"})
+
+    monkeypatch.setattr("sarang.orchestrator.stream_local_answer", slow_tail)
+
+    key, queue = orchestrator.registry.bus.subscribe()
+    await orchestrator.run_turn(session, "What did he do at ARAI?")
+    events = await collect(queue, "metrics.turn")
+    metrics = [event for event in events if event.type.value == "metrics.turn"][0]
+    stages = metrics.payload["durations_ms"]
+
+    assert stages["llm_total"] >= 400.0
+    assert stages["segment"] < 150.0
+    assert stages["llm_ttft"] + stages["segment"] < stages["llm_total"]
+
+    final = [event for event in events if event.type.value == "assistant.final"]
+    assert "ARAI" in final[-1].payload["text"]
+
+
 async def test_empty_text_does_not_start_a_turn(orchestrator, session):
     before = session.turn_counter
     await orchestrator.run_turn(session, "   ")
