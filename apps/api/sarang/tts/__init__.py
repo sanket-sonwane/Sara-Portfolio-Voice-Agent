@@ -17,6 +17,7 @@ from ..config import Settings
 from .base import TTS, AudioSpan, TTSError
 from .cartesia import CartesiaTTS
 from .sarvam import SarvamTTS
+from .smallest import SmallestTTS
 from .synthetic import SyntheticTTS
 
 log = logging.getLogger(__name__)
@@ -77,6 +78,16 @@ def build_tts(settings: Settings) -> TTS:
             base_url=settings.sarvam_base_url,
             model=settings.sarvam_tts_model,
             voice=settings.sarvam_voice,
+        )
+        return FallbackTTS(primary)
+    if provider == "smallest" and settings.smallest_key:
+        primary = SmallestTTS(
+            api_key=settings.smallest_key,
+            ws_url=settings.smallest_ws_url,
+            model=settings.smallest_model,
+            voice_id=settings.smallest_voice,
+            language=settings.smallest_language,
+            max_concurrency=settings.smallest_max_concurrency,
         )
         return FallbackTTS(primary)
     if provider == "cartesia" and settings.cartesia_key:

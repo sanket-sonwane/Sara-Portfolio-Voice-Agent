@@ -42,10 +42,11 @@ PROFILES: dict[str, ProviderProfile] = {
         name="bom-india",
         asr="sarvam",
         llm="sarvam",
-        tts="cartesia",
+        tts="smallest",
         note=(
-            "India-first: Sarvam ASR and LLM in-region; Cartesia TTS for the "
-            "lowest measured time-to-first-audio."
+            "India-first: Sarvam ASR and LLM in-region; Smallest Lightning TTS "
+            "for an Indian-accented voice and enough concurrency to speak every "
+            "segment of an answer."
         ),
     ),
     "iad-global": ProviderProfile(
@@ -150,6 +151,16 @@ class Settings:
     cartesia_ws_url: str = "wss://api.cartesia.ai/tts/websocket"
     cartesia_http_url: str = "https://api.cartesia.ai"
 
+    smallest_key: str = ""
+    smallest_model: str = "lightning_v3.1_pro"
+    smallest_voice: str = "rhea"
+    # "hi" is Indian-accented English with Hindi code-switching; "en" is UK/US.
+    smallest_language: str = "hi"
+    smallest_ws_url: str = "wss://api.smallest.ai/waves/v1/tts/live"
+    # Lightning allows 10-15 concurrent streams. Four covers the two or three
+    # segments a 35-word answer produces without letting a burst look abusive.
+    smallest_max_concurrency: int = 4
+
     # Retrieval
     database_url: str = ""
     retrieval_backend: str = ""
@@ -199,6 +210,7 @@ class Settings:
             "groq": bool(self.groq_key),
             "nemotron": bool(self.nvidia_key),
             "cartesia": bool(self.cartesia_key),
+            "smallest": bool(self.smallest_key),
         }.get(which, False)
 
     def describe(self) -> dict:
@@ -320,6 +332,14 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         tts_max_concurrency=integer("TTS_MAX_CONCURRENCY", 2),
         cartesia_ws_url=get("CARTESIA_WS_URL", "wss://api.cartesia.ai/tts/websocket"),
         cartesia_http_url=get("CARTESIA_BASE_URL", "https://api.cartesia.ai"),
+        smallest_key=get("SMALLEST_API_KEY"),
+        smallest_model=get("SMALLEST_MODEL", "lightning_v3.1_pro"),
+        smallest_voice=get("SMALLEST_VOICE", "rhea"),
+        smallest_language=get("SMALLEST_LANGUAGE", "hi"),
+        smallest_ws_url=get(
+            "SMALLEST_WS_URL", "wss://api.smallest.ai/waves/v1/tts/live"
+        ),
+        smallest_max_concurrency=integer("SMALLEST_MAX_CONCURRENCY", 4),
         database_url=get("DATABASE_URL"),
         cache_dir=get("SARANG_CACHE_DIR"),
         endpoint_silence_ms=integer("ENDPOINT_SILENCE_MS", 800),
