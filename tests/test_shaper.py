@@ -90,6 +90,54 @@ async def test_first_audio_callback_fires_once_per_generation():
     assert seen == [1, 2]
 
 
+async def test_first_frame_of_a_generation_is_not_paced():
+    """The wait the visitor feels is this frame; it must not pay a cadence."""
+    import time
+
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+
+    started = time.perf_counter()
+    frame = await egress.next_frame()
+    first_ms = (time.perf_counter() - started) * 1000
+
+    assert frame.any()
+    assert first_ms < 10.0, f"first frame held for {first_ms:.1f} ms"
+
+    # Subsequent frames do keep the 20 ms cadence.
+    egress.put(pcm(FRAME_SAMPLES * 4), 1, "trn_1")
+    started = time.perf_counter()
+    await egress.next_frame()
+    assert (time.perf_counter() - started) * 1000 >= 15.0
+
+
+async def test_first_frame_needs_only_one_frame_of_audio():
+    egress = AudioEgress(prebuffer_ms=40)
+    egress.set_generation(1)
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+
+    frame = await egress.next_frame()
+
+    assert frame.any()
+    assert egress.underruns == 0
+
+
+async def test_after_the_first_frame_one_frame_is_not_enough_to_pace():
+    """The pre-buffer still governs resumption, but never the first frame."""
+    egress = AudioEgress(prebuffer_ms=40)
+    egress.set_generation(1)
+
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+    assert (await egress.next_frame()).any()
+
+    # A single new frame is below the two-frame pre-buffer, so the shaper would
+    # rather emit silence once than start a stutter it cannot finish.
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+    assert not (await egress.next_frame()).any()
+    assert egress.underruns == 1
+
+
 async def test_underrun_is_counted_and_silent():
     egress = AudioEgress()
     egress.set_generation(1)

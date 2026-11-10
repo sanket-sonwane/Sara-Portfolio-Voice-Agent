@@ -98,14 +98,20 @@ class AudioEgress:
             if time.perf_counter() < self._flush_guard_until:
                 return silent_frame(FRAME_SAMPLES)
 
-            enough = self.pending_samples() >= FRAME_SAMPLES * self._prebuffer_frames
             generation = self.generation
+            first_for_generation = generation not in self._first_audio_sent
+            # The first frame of a turn is the one the visitor is waiting for.
+            # Holding it for the 40 ms pre-buffer costs latency and buys nothing
+            # on a fresh generation, because a single 20 ms frame is already
+            # playable. Later frames keep the pre-buffer.
+            needed = FRAME_SAMPLES if first_for_generation else FRAME_SAMPLES * self._prebuffer_frames
+            enough = self.pending_samples() >= needed
             if not enough and not self._residual.size:
                 self.underruns += 1
                 frame = silent_frame(FRAME_SAMPLES)
             else:
                 frame = self._next_chunk_frame()
-                if frame.any() and generation not in self._first_audio_sent:
+                if frame.any() and first_for_generation:
                     self._first_audio_sent.add(generation)
                     if self.on_first_audio is not None:
                         with contextlib.suppress(Exception):
@@ -113,14 +119,19 @@ class AudioEgress:
 
             now = time.perf_counter()
             if self._deadline is None:
-                self._deadline = now
-            self._deadline += 0.020
-            delay = self._deadline - now
-            if delay < -0.100:
-                # We fell more than five frames behind: resynchronise instead of
-                # trying to catch up by bursting frames.
+                # Nothing has been paced yet, so there is no previous frame to
+                # keep a 20 ms cadence from. Send immediately and start the
+                # clock here; otherwise every turn pays one frame of silence.
                 self._deadline = now
                 delay = 0.0
+            else:
+                self._deadline += 0.020
+                delay = self._deadline - now
+                if delay < -0.100:
+                    # We fell more than five frames behind: resynchronise instead
+                    # of trying to catch up by bursting frames.
+                    self._deadline = now
+                    delay = 0.0
         if delay > 0:
             await asyncio.sleep(delay)
         return frame
