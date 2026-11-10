@@ -1,0 +1,575 @@
+# Sara — canonical facts about Sanket
+#
+# This file is the single source of truth for everything the voice agent may say.
+# It is human-curated, not generated. Sources are inputs (resume, portfolio site,
+# repositories, the owner's own words); this file is the approved output of
+# reading them.
+#
+# Rules enforced by kb/validate.py:
+#   * every skill, project and claim carries `origin`
+#   * every numeric result carries a `source` describing where the number came from
+#   * `pending` items are not answerable and must be refused, not guessed
+#
+# origin values:
+#   resume    - stated in the résumé PDF
+#   portfolio - stated on https://sanket--sonwane.vercel.app
+#   repo      - stated in a public repository README
+#   stated    - stated directly by the owner during curation
+#
+# The résumé is tailored per job description, so absence from it is not evidence
+# of absence of a skill. Presence on the portfolio site is equally authoritative.
+
+meta:
+  version: 2
+  updated: "2026-11-10"
+  curated_by: "Sanket Sonwane"
+  review_note: >
+    All skills listed here are authoritative. The résumé is tailored per role and
+    omits some skills and projects that exist; the portfolio site is broader.
+    Claims not present in this file must not be asserted.
+
+owner:
+  name: "Sanket Sonwane"
+  full_name: "Sonwane Sanket Ankush"
+  headline: "AI Engineer"
+  tagline: "Building intelligent systems that reason, retrieve and act."
+  location: "Pune, India"
+  email: "sanketsonwane512@gmail.com"
+  links:
+    portfolio: "https://sanket--sonwane.vercel.app"
+    github: "https://github.com/sanket-sonwane"
+    linkedin: "https://www.linkedin.com/in/sanket--sonwane/"
+  summary: >
+    AI Engineer with experience building production-grade Agentic AI, LLM and RAG
+    systems through research and industry internships. Experienced in multi-agent
+    workflows, retrieval-augmented generation, backend engineering and LLM
+    orchestration, with hands-on work in SLM fine-tuning and QLoRA.
+  focus: >
+    Agentic AI, LLM systems, RAG, multi-agent architectures and applied AI research.
+  availability: >
+    Open to AI engineering roles, research, internships and ambitious technical projects.
+  origin: [resume, portfolio]
+
+profile:
+  # Who Sanket is beyond the CV. All of this is the owner's own wording, curated
+  # for speech; nothing here is inferred from the résumé.
+  motivation: >
+    Sanket likes the moment when a messy, manual problem becomes a system that
+    just works, and AI agents let him do that at a scale that was not possible
+    before. He also values that the field is still being figured out, so there is
+    room to build things nobody has built yet.
+  vision: >
+    Make AI agents something people can actually trust with real work: accurate,
+    auditable systems that are useful in everyday settings in India.
+  mission: >
+    Go deep on agentic systems that hold up in production, and on voice agents.
+    His latest project, the Agentic Commerce Gateway, lets AI agents make
+    payments with strict money controls and verifiable records. He is also
+    sharpening RAG, multi-agent orchestration and small-model fine-tuning.
+  values:
+    - "Grounding over guessing: answers come from real data, not model confidence."
+    - "Ship something measurable rather than polish a demo."
+    - "Design for failure recovery and evaluation, not just the happy path."
+    - "Never present a number or claim that cannot be backed up."
+  working_style: >
+    Prefers measurable delivery over demos, and treats failure recovery and
+    evaluation as part of the work rather than an afterthought.
+  community: >
+    Volunteers with Developer Tech Society Pune, helping organise meetups and
+    engaging a community of over a thousand technology professionals. Led the
+    Training and Placement team at PVPIT and the HackerRank campus crew, and has
+    hosted state-level and international events. Believes that if you learned
+    from a community, you should help build one.
+  interests:
+    - "Chess"
+    - "Travel"
+  origin: [stated]
+
+role_fit:
+  # How the agent may talk about fit. Positive in tone, but every claim has to
+  # point at documented work; an undocumented requirement is named as not
+  # covered, never as a weakness.
+  headline: "He builds agentic systems that work in production."
+  target_roles:
+    - "Agentic AI Engineer"
+    - "LLM Engineer"
+    - "Voice agent engineer"
+    - "AI backend engineer"
+  proof: "At ARAI he cut a ten-hour process down to ten seconds."
+  strengths:
+    - claim: "Agentic systems that hold up in production"
+      evidence: agentic-commerce-gateway
+    - claim: "RAG and retrieval systems"
+      evidence: tattvaquest
+    - claim: "Multi-agent orchestration"
+      evidence: qa-forge
+    - claim: "Production Python automation"
+      evidence: arai
+  guidance: >
+    Answer positively from documented evidence only. Name the closest documented
+    work. If a requirement is not documented, say the portfolio does not cover it
+    and offer to walk through what he has built. Never claim a skill, employer or
+    metric outside the FACTS, and never guarantee an outcome.
+  origin: [stated]
+
+off_topic:
+  # Said when the question has nothing to do with Sanket. Humble, brief, and it
+  # never attempts the unrelated task.
+  response: >
+    Sorry, I'm Sanket's voice agent, so I can only speak to him and his work.
+    Happy to talk about his projects, experience, or how he'd fit a role.
+
+voice_persona:
+  # Guidance for the spoken agent, not facts about the owner.
+  tone: "Direct, warm, technically fluent. Never salesy."
+  length: "Answer in one to three short spoken sentences unless the visitor asks for depth."
+  grounding: >
+    Quote documented facts. Judgements about fit, motivation or direction are
+    allowed, but only when grounded in those facts, framed as an assessment, and
+    never guaranteed. If a fact is not in this file, say it is not documented
+    rather than inferring it.
+  style_rules:
+    - "Speak numbers the way a person would: 'about ninety-eight percent', not '98.00%'."
+    - "Never read out URLs; offer to share the link instead."
+    - "Do not repeat the question back before answering."
+
+experience:
+  - id: epic
+    org: "EPIC Technology Research Private Limited"
+    role: "Agentic AI Engineer Intern"
+    location: "Pune"
+    start: "2026-05"
+    end: "2026-07"
+    summary: >
+      Built an Agentic AI-powered Municipal Asset Intelligence Copilot using
+      intent-aware query routing, hybrid RAG, PostgreSQL, pgvector and on-prem LLM
+      orchestration, enabling accurate multi-step reasoning across millions of
+      municipal asset records.
+    stack: [Python, "Hybrid RAG", PostgreSQL, pgvector, "On-prem LLM orchestration"]
+    highlights:
+      - "Intent-aware query routing across large record sets."
+      - "Hybrid retrieval combining lexical and vector search."
+      - "On-premises LLM orchestration for data-residency constraints."
+    metrics:
+      - label: "records reasoned over"
+        value: "millions"
+        source: "portfolio:case-study/municipal-copilot"
+    limitations:
+      - "No published evaluation numbers; the scale claim is qualitative."
+    origin: [resume, portfolio]
+
+  - id: arai
+    org: "ARAI — Automotive Research Association of India"
+    role: "Python Developer Intern"
+    location: "Pune"
+    start: "2025-12"
+    end: "2026-02"
+    aliases:
+      - "ARAI"
+      - "A R A I"
+      - "ARII"
+      - "ARI"
+      - "Automotive Research Association of India"
+      - "Automotive Research Association"
+    summary: >
+      Built and deployed a production Python automation pipeline on the ZEISS INSPECT
+      API, automating marker association, validation and quality checks for industrial
+      photogrammetry.
+    stack: [Python, "ZEISS INSPECT API", Automation]
+    highlights:
+      - "Automated marker association and validation steps that were previously manual."
+      - "Replaced a multi-hour manual workflow with an automated run."
+    metrics:
+      - label: "processing time"
+        value: "10 hours to 10 seconds"
+        source: "resume:experience/arai"
+      - label: "processing-time reduction"
+        value: "99.94 percent"
+        source: "resume:experience/arai"
+    limitations:
+      - "Single-team deployment inside a research association; not a public product."
+    origin: [resume, portfolio]
+
+  - id: coep
+    org: "COEP Technological University"
+    role: "Research Intern — Network Security and 5G Systems"
+    location: "Pune"
+    start: "2025-05"
+    end: "2025-07"
+    summary: >
+      Developed a lightweight SDN-based rogue-node detection framework for 5G
+      multi-access edge computing, validated through Python, Mininet and Ryu-based
+      simulation, resulting in a paper submission to AEUE.
+    stack: [Python, Mininet, Ryu, SDN, "5G MEC", "Network security"]
+    highlights:
+      - "Trust-based detection of rogue nodes in a MEC topology."
+      - "Simulated and validated with Mininet and Ryu."
+    metrics:
+      - label: "detection accuracy"
+        value: "98 percent"
+        source: "resume:experience/coep"
+      - label: "CPU usage"
+        value: "under 3 percent"
+        source: "resume:experience/coep"
+      - label: "added delay"
+        value: "under 50 milliseconds"
+        source: "resume:experience/coep"
+    limitations:
+      - "Results come from simulation, not a production 5G deployment."
+    origin: [resume, portfolio]
+
+projects:
+  - id: agentic-commerce-gateway
+    name: "Agentic Commerce Gateway"
+    short_name: "ACG"
+    tagline: "AI-transactable merchant infrastructure"
+    kind: personal
+    period: "2026-08"
+    links:
+      repo: "https://github.com/sanket-sonwane/agentic-commerce-gateway"
+      case_study: "https://sanket--sonwane.vercel.app/projects/agentic-commerce-gateway"
+    stack: [Python, FastAPI, Groq, "Razorpay Test Mode", Ed25519, SQLite, React, Vite]
+    summary: >
+      An agentic-commerce infrastructure layer that makes merchants transactable by
+      unknown AI buyers, with deterministic money authority, signed user approval,
+      real Razorpay test-mode payments, failure recovery, protocol interoperability
+      and independently verifiable transaction provenance.
+    problem: >
+      Agents can browse and decide, but commerce infrastructure assumes a human is
+      clicking the button and holding the authority to spend.
+    approach:
+      - "Server-authoritative pricing so the agent cannot negotiate its own totals."
+      - "Ed25519-signed user intent for explicit spend approval."
+      - "Idempotent order finalisation with reservation-backed fulfilment."
+      - "SHA-256 hash-chained audit trail for verifiable provenance."
+    metrics: []
+    limitations:
+      - "Payments run in Razorpay test mode; no production money movement is claimed."
+      - "The flow diagram on the portfolio is illustrative, not production data."
+    origin: [resume, portfolio]
+
+  - id: municipal-copilot
+    name: "Municipal Asset Intelligence Copilot"
+    tagline: "Agentic AI copilot for multi-step reasoning over municipal asset records"
+    kind: internship
+    period: "2026-05..2026-07"
+    at: epic
+    links:
+      case_study: "https://sanket--sonwane.vercel.app/projects/municipal-copilot"
+    stack: [Python, "Hybrid RAG", PostgreSQL, pgvector, "On-prem LLM orchestration"]
+    summary: >
+      An intelligence copilot built during the EPIC internship that answers multi-step
+      questions across millions of municipal asset records using intent detection,
+      query routing and hybrid retrieval.
+    approach:
+      - "Intent detection and query routing before retrieval."
+      - "Hybrid lexical plus vector search over PostgreSQL and pgvector."
+      - "On-premises model orchestration."
+    metrics:
+      - label: "records reasoned over"
+        value: "millions"
+        source: "portfolio:case-study/municipal-copilot"
+    limitations:
+      - "No published accuracy or latency figures."
+    origin: [resume, portfolio]
+
+  - id: tattvaquest
+    name: "TattvaQuest"
+    tagline: "Autonomous knowledge retrieval agent"
+    kind: personal
+    period: "2026-04"
+    links:
+      repo: "https://github.com/sanket-sonwane"
+      case_study: "https://sanket--sonwane.vercel.app/projects/tattvaquest"
+    stack: [LlamaIndex, RAG, Embeddings, "Hybrid search", "Tool calling"]
+    summary: >
+      An agentic RAG system for multi-document question answering, covering chunking,
+      embedding-based retrieval, hybrid search, query routing, tool calling and
+      contextual reasoning.
+    approach:
+      - "Heading-aware chunking before embedding."
+      - "Hybrid retrieval rather than dense-only search."
+      - "Query routing and contextual reasoning over multiple documents."
+    metrics: []
+    limitations:
+      - "Retrieval-quality optimisation is described qualitatively; no published scores."
+    origin: [resume, portfolio]
+
+  - id: qa-forge
+    name: "QA-Forge"
+    tagline: "AI-native multi-agent auditing platform"
+    kind: personal
+    period: "2026-03"
+    links:
+      repo: "https://github.com/sanket-sonwane"
+      case_study: "https://sanket--sonwane.vercel.app/projects/qa-forge"
+    stack: [LangGraph, FastAPI, "Multi-agent AI"]
+    summary: >
+      A multi-agent platform using LangGraph and FastAPI that supports agent
+      collaboration, task orchestration, tool execution, API validation, adversarial
+      testing and automated engineering reports.
+    approach:
+      - "Orchestrator coordinating specialised agents."
+      - "Adversarial API testing as a first-class agent task."
+      - "Automated report generation from agent findings."
+    metrics: []
+    limitations:
+      - "Agent roles are kept generic; only implementation-backed roles should be named."
+    origin: [resume, portfolio]
+
+  - id: class-node
+    name: "Class-Node"
+    tagline: "Real-time quiz and classroom interaction system"
+    kind: personal
+    period: "2025-01"
+    links:
+      repo: "https://github.com/sanket-sonwane"
+      case_study: "https://sanket--sonwane.vercel.app/projects/class-node"
+    stack: [React, TypeScript, Node.js, Supabase]
+    summary: >
+      A real-time quiz platform with synchronised multiplayer participation,
+      AI-generated quizzes, live analytics dashboards and scheduled assessments.
+    approach:
+      - "Realtime synchronisation so participants share the same question state."
+      - "AI-generated question sets."
+      - "Live analytics for the host."
+    metrics:
+      - label: "weekly users"
+        value: "100+"
+        source: "portfolio:case-study/class-node"
+    limitations: []
+    origin: [portfolio]
+
+  - id: visionmitra
+    name: "VisionMitra"
+    tagline: "Voice-first navigation and transit data platform"
+    kind: personal
+    period: "2025-01"
+    links:
+      repo: "https://github.com/sanket-sonwane"
+    stack: [Python, "OpenStreetMap / Overpass", "PMPML GTFS", KDTree, "A*", YOLOv8]
+    summary: >
+      A voice-first navigation system using OpenStreetMap and Overpass data with Pune
+      PMPML GTFS transit data, including nearest-stop search, route planning and
+      visual recognition.
+    approach:
+      - "KDTree-based nearest-stop lookup over transit data."
+      - "A* route planning across the stop network."
+      - "Fine-tuned YOLOv8 for visual recognition."
+    metrics:
+      - label: "transit stops processed"
+        value: "1,300+"
+        source: "resume:projects/visionmitra"
+      - label: "routes processed"
+        value: "500+"
+        source: "resume:projects/visionmitra"
+    limitations:
+      - "Data coverage is specific to Pune PMPML."
+    origin: [resume]
+
+research:
+  - id: rogue-nodes
+    title: "Lightweight Trust-Based Detection of Rogue Nodes in MEC"
+    venue: "AEUE (Q2 journal)"
+    aliases:
+      - "AEUE"
+      - "A E U E"
+      - "AEUE paper"
+      - "rogue nodes MEC paper"
+      - "COEP research paper"
+    status: submitted
+    year: 2025
+    authors_note: "First author. Work done as a research intern at COEP."
+    summary: >
+      A lightweight SDN-based rogue-node detection framework for 5G multi-access edge
+      computing, validated with Python, Mininet and Ryu simulations.
+    metrics:
+      - label: "detection accuracy"
+        value: "98 percent"
+        source: "resume:research"
+      - label: "CPU usage"
+        value: "under 3 percent"
+        source: "resume:research"
+      - label: "delay"
+        value: "under 50 milliseconds"
+        source: "resume:research"
+    limitations:
+      - "Simulation-based validation, not a production deployment."
+      - "Peer review is not complete. The paper is submitted, not accepted or published."
+    origin: [resume, portfolio]
+
+education:
+  - id: be
+    qualification: "B.E. Computer Engineering"
+    institution: "Savitribai Phule Pune University (SPPU)"
+    start: 2024
+    end: 2027
+    score: "9.14"
+    score_label: "CGPA"
+    status: ongoing
+    note: "The portfolio site labels the same figure as SGPA."
+    origin: [resume, portfolio, stated]
+  - id: diploma
+    qualification: "Diploma in Information Technology"
+    institution: "AISSMS Polytechnic, Pune"
+    start: 2021
+    end: 2024
+    score: "85.13"
+    score_label: "percentage"
+    status: completed
+    origin: [resume, portfolio]
+
+skills:
+  # The résumé is tailored per job description and omits some skills; the portfolio
+  # and repositories are equally authoritative. `evidence` names a project id only
+  # where a public artifact clearly demonstrates the skill.
+  ai_llm:
+    - {name: "Agentic AI", origin: [portfolio, resume], evidence: agentic-commerce-gateway}
+    - {name: "RAG", origin: [portfolio, resume], evidence: tattvaquest}
+    - {name: "Multi-agent systems", origin: [portfolio, resume], evidence: qa-forge}
+    - {name: "LangGraph", origin: [portfolio, resume], evidence: qa-forge}
+    - {name: "LlamaIndex", origin: [portfolio, resume], evidence: tattvaquest}
+    - {name: "Hugging Face", origin: [portfolio], evidence: null}
+    - {name: "LoRA", origin: [portfolio, resume], evidence: null}
+    - {name: "QLoRA", origin: [portfolio, resume], evidence: null}
+    - {name: "PEFT", origin: [portfolio, resume], evidence: null}
+    - {name: "MCP", origin: [portfolio, resume], evidence: null}
+    - {name: "Tool calling", origin: [portfolio, resume], evidence: tattvaquest}
+    - {name: "SLM fine-tuning", origin: [portfolio, resume], evidence: null}
+    - {name: "LLM evaluation", origin: [portfolio, resume], evidence: null}
+  backend:
+    - {name: "Python", origin: [portfolio, resume], evidence: municipal-copilot}
+    - {name: "FastAPI", origin: [portfolio, resume], evidence: qa-forge}
+    - {name: "Node.js", origin: [portfolio, resume], evidence: class-node}
+    - {name: "REST APIs", origin: [portfolio, resume], evidence: null}
+    - {name: "PostgreSQL", origin: [portfolio, resume], evidence: municipal-copilot}
+    - {name: "pgvector", origin: [portfolio, resume], evidence: municipal-copilot}
+    - {name: "Supabase", origin: [portfolio, resume], evidence: class-node}
+  cloud_devops:
+    - {name: "AWS Bedrock", origin: [portfolio], evidence: null}
+    - {name: "Docker", origin: [portfolio, resume], evidence: null}
+    - {name: "Kubernetes", origin: [portfolio], evidence: null}
+    - {name: "CI/CD", origin: [portfolio, resume], evidence: null}
+    - {name: "Git", origin: [portfolio, resume], evidence: null}
+    - {name: "GitHub", origin: [portfolio, resume], evidence: null}
+  programming:
+    - {name: "Python", origin: [portfolio, resume], evidence: null}
+    - {name: "Java", origin: [portfolio, resume], evidence: null}
+    - {name: "C++", origin: [portfolio, resume], evidence: null}
+    - {name: "JavaScript", origin: [portfolio, resume], evidence: class-node}
+    - {name: "TypeScript", origin: [portfolio], evidence: class-node}
+    - {name: "SQL", origin: [portfolio, resume], evidence: null}
+    - {name: "React", origin: [portfolio, resume], evidence: class-node}
+
+leadership:
+  - id: tpc
+    role: "Training and Placement Coordinator — Head"
+    org: "PVPIT"
+    summary: "Led a ten-student coordination team supporting campus placement operations and student engagement."
+    origin: [resume, portfolio]
+  - id: hackerrank
+    role: "HackerRank Campus Crew Lead"
+    summary: "Led a five-student core team organising campus-wide coding challenges and technical workshops."
+    origin: [resume, portfolio]
+  - id: events
+    role: "Event host"
+    summary: "Hosted three or more state-level events and one international event."
+    origin: [resume, portfolio]
+  - id: dts
+    role: "Core volunteer member, DTS Pune"
+    summary: "Engages with a community of over a thousand technology professionals and helps organise local meetups."
+    origin: [resume]
+
+achievements:
+  - id: nvidia-workshop
+    title: "Presented at NVIDIA's Nemotron Workshop"
+    summary: >
+      Presented an AI-powered cybersecurity project to an audience of about 150 AI
+      engineers, NVIDIA teams and industry professionals.
+    caveat: "Presentation, not employment or affiliation with NVIDIA."
+    origin: [resume, portfolio]
+  - id: paper-submission
+    title: "Research paper submitted to AEUE (Q2)"
+    summary: "Submitted the rogue-node detection paper described under research."
+    caveat: "Submitted only. Not accepted, not published."
+    origin: [resume, portfolio]
+
+# ---------------------------------------------------------------------------
+# Not yet documented. The agent must refuse these rather than improvise, and the
+# evaluation set in bench/questions exercises them deliberately.
+# ---------------------------------------------------------------------------
+pending:
+  - id: cpu-scheduling
+    topic: "CPU scheduling / sched_ext project"
+    status: "exists per owner, documented nowhere yet"
+    action: >
+      Needs a README or structured description (problem, mechanism, kernel/eBPF
+      details, measured results, limitations) before it can be ingested. Until then
+      the agent must say it is not documented in the portfolio.
+  - id: publications
+    topic: "Publication outcome for the AEUE submission"
+    status: unknown
+    action: "Update `research[0].status` when the review outcome is known."
+
+boundaries:
+  never_claim:
+    - "That the AEUE paper was accepted or published."
+    - "Production payment processing in the Agentic Commerce Gateway."
+    - "Employment or affiliation with NVIDIA."
+    - "Any metric not listed under a `metrics` key in this file."
+    - "Kubernetes, AWS Bedrock or TypeScript depth beyond general familiarity."
+  refuse_topics:
+    - "Compensation expectations or salary history."
+    - "Personal contact details beyond the public email in `owner`."
+    - "Home address, date of birth, or family details."
+    - "Opinions about other candidates, employers or colleagues."
+  deflect_topics:
+    - "Questions about Sanket's weaknesses: stay positive and redirect to documented work."
+    - "Questions unrelated to Sanket, his work or his background: apologise briefly and return to him."
+
+lexicon:
+  # Terms the ASR should bias toward and the TTS should get right.
+  # Phonetic spellings are intentionally omitted until the owner confirms them.
+  proper_nouns:
+    - VisionMitra
+    - TattvaQuest
+    - QA-Forge
+    - Class-Node
+    - Agentic Commerce Gateway
+    - Nemotron
+    - Cartesia
+    - Groq
+    - LlamaIndex
+    - LangGraph
+    - pgvector
+    - Mininet
+    - ZEISS INSPECT
+    - SPPU
+    - COEP
+    - ARAI
+    - PVPIT
+    - AISSMS
+    - AEUE
+  technical:
+    - sched_ext
+    - hybrid retrieval
+    - multi-access edge computing
+    - QLoRA
+    - quantised fine-tuning
+    - retrieval-augmented generation
+  # Recogniser output that is known to be wrong, mapped to the right spelling.
+  # Only variants observed in real transcripts belong here: this is a correction
+  # table, not a guess. Keyed by the correct term; each value is a complete
+  # phrase or word that must be replaced as a unit.
+  #
+  # Applied by apps/api/sarang/asr/normalize.py to every transcript, so the
+  # words on screen match the facts even when the recogniser's biasing loses.
+  misheard:
+    ARAI:
+      - ARII
+      - ARI
+      - AAI
+      - AII
+      - A R A I
+    AEUE:
+      - A E U E
