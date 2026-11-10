@@ -160,7 +160,9 @@ async def test_segment_mark_measures_the_wait_for_the_first_spoken_segment(
     metrics = [event for event in events if event.type.value == "metrics.turn"][0]
     stages = metrics.payload["durations_ms"]
 
-    assert stages["llm_total"] >= 400.0
+    # Windows' clock granularity can make a 400 ms sleep report ~383 ms, so the
+    # floor is loose; the ratio is the assertion that matters.
+    assert stages["llm_total"] >= 300.0
     assert stages["segment"] < 150.0
     assert stages["llm_ttft"] + stages["segment"] < stages["llm_total"]
 
