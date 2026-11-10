@@ -1,7 +1,12 @@
-"""Cartesia multiplexing: one socket, many independent utterances.
+"""TTS adapters: concurrency, attribution and cancellation.
 
-The bug these pin: a lock around the whole receive loop made a second speaker wait
-for the first one's audio to finish. Sessions must not serialise.
+Cartesia multiplexes many utterances over one socket, so the bug these pin is a
+lock around the whole receive loop that made a second speaker wait for the first
+one's audio to finish. Sessions must not serialise.
+
+Smallest Lightning is the opposite protocol: it does not echo ``context_id`` and
+does not reliably complete two contexts on one socket, so its tests pin the
+inverse property - one socket per in-flight segment, reused sequentially.
 """
 
 from __future__ import annotations
@@ -13,7 +18,9 @@ import json
 import numpy as np
 import pytest
 from sarang.tts import cartesia as cartesia_module
+from sarang.tts import smallest as smallest_module
 from sarang.tts.cartesia import CartesiaTTS
+from sarang.tts.smallest import SmallestTTS
 
 
 def _frame(samples: list[int]) -> str:
@@ -159,3 +166,196 @@ async def test_provider_error_is_raised_for_the_matching_context(monkeypatch):
     )
     with pytest.raises(cartesia_module.TTSError):
         await asyncio.wait_for(task, timeout=1.0)
+
+
+# --------------------------------------------------------------------- smallest
+
+
+class FakeSmallestSocket:
+    """One Lightning socket: answers each request, then reports `complete`."""
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.incoming: asyncio.Queue[str] = asyncio.Queue()
+        self.sent: list[dict] = []
+        self.closed = False
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def send(self, raw: str) -> None:
+        payload = json.loads(raw)
+        self.sent.append(payload)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        asyncio.create_task(self._answer(self.delay))
+
+    async def _answer(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self.closed:
+            return
+        pcm = np.array([100, 200, 300, 400] * 120, dtype="<i2").tobytes()
+        encoded = base64.b64encode(pcm).decode()
+        # Three chunks: the stateful resampler buffers the first one.
+        for _ in range(3):
+            await self.incoming.put(
+                json.dumps({"status": "chunk", "data": {"audio": encoded}})
+            )
+        await self.incoming.put(json.dumps({"status": "complete"}))
+        self.in_flight -= 1
+
+    async def recv(self) -> str:
+        return await self.incoming.get()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def _drain(tts) -> int:
+    total = 0
+    async for span in tts.synthesize("text", context_id="ctx"):
+        total += int(span.pcm.size)
+    return total
+
+
+async def test_smallest_opens_one_socket_per_segment(monkeypatch):
+    """Two segments in flight must not share a connection.
+
+    Lightning does not echo `context_id`, and two contexts on one socket did not
+    each get a `complete`. Sharing would therefore mis-attribute audio.
+    """
+    sockets: list[FakeSmallestSocket] = []
+
+    async def fake_connect(*args, **kwargs):
+        socket = FakeSmallestSocket(delay=0.05)
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live")
+
+    results = await asyncio.gather(
+        tts.synthesize("one", context_id="a").__anext__(),
+        tts.synthesize("two", context_id="b").__anext__(),
+    )
+
+    assert all(span.pcm.size > 0 for span in results)
+    assert len(sockets) == 2
+    assert all(socket.max_in_flight == 1 for socket in sockets)
+
+
+async def test_smallest_reuses_a_socket_sequentially(monkeypatch):
+    sockets: list[FakeSmallestSocket] = []
+
+    async def fake_connect(*args, **kwargs):
+        socket = FakeSmallestSocket()
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live")
+
+    first = await _drain(tts)
+    second = await _drain(tts)
+
+    assert first > 0 and second > 0
+    assert len(sockets) == 1
+
+
+async def test_smallest_request_shape(monkeypatch):
+    sockets: list[FakeSmallestSocket] = []
+
+    async def fake_connect(*args, **kwargs):
+        socket = FakeSmallestSocket()
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live", language="hi")
+
+    await _drain(tts)
+
+    payload = sockets[0].sent[0]
+    assert payload["complete_backoff_ms"] == 0, "the 4 s default would inflate every turn"
+    assert payload["continue"] is False
+    assert payload["language"] == "hi"
+    assert payload["voice_id"] == "rhea"
+    assert payload["model"] == "lightning_v3.1_pro"
+
+
+async def test_smallest_cancel_closes_the_socket(monkeypatch):
+    """`context_close` kept sending audio for ~9 s; closing the socket is the fix."""
+    sockets: list[FakeSmallestSocket] = []
+
+    async def fake_connect(*args, **kwargs):
+        socket = FakeSmallestSocket(delay=5.0)
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live")
+
+    task = asyncio.create_task(_drain(tts))
+    await asyncio.sleep(0.02)
+    await tts.cancel("ctx")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sockets[0].closed is True
+
+
+async def test_smallest_error_frame_raises(monkeypatch):
+    socket = FakeSmallestSocket(delay=5.0)
+
+    async def fake_connect(*args, **kwargs):
+        return socket
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live")
+
+    task = asyncio.create_task(_drain(tts))
+    await asyncio.sleep(0.02)
+    await socket.incoming.put(json.dumps({"status": "error", "message": "boom"}))
+    with pytest.raises(smallest_module.TTSError):
+        await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_smallest_cancel_twice_is_a_no_op(monkeypatch):
+    """Cancel and the cancelled segment's cleanup both reach the connection."""
+    sockets: list[FakeSmallestSocket] = []
+
+    async def fake_connect(*args, **kwargs):
+        socket = FakeSmallestSocket(delay=5.0)
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live")
+
+    task = asyncio.create_task(_drain(tts))
+    await asyncio.sleep(0.02)
+    await tts.cancel("ctx")
+    await tts.cancel("ctx")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sockets[0].closed is True
+
+
+async def test_smallest_close_survives_a_cancelled_teardown(monkeypatch):
+    """Lifespan shutdown is often already cancelled; that must not become an error."""
+
+    class CancelledCloseSocket(FakeSmallestSocket):
+        async def close(self) -> None:
+            self.closed = True
+            raise asyncio.CancelledError
+
+    async def fake_connect(*args, **kwargs):
+        return CancelledCloseSocket()
+
+    monkeypatch.setattr(smallest_module, "ws_connect", fake_connect)
+    tts = SmallestTTS(api_key="test", ws_url="wss://example.test/live")
+    await tts.prepare("hello")
+
+    await tts.close()
