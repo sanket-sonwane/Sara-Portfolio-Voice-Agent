@@ -2,10 +2,11 @@
 #
 # Deploy from the repository root:
 #   fly launch --no-deploy --copy-config --name sarang-gateway
-#   fly secrets set SESSION_SECRET=... SARVAM_API_KEY=... GEMINI_API_KEY=...
+#   fly secrets set SESSION_SECRET=... SARVAM_API_KEY=... SMALLEST_API_KEY=...
 #   fly deploy
 #
-# `bom` (Mumbai) is the default because the audience is in India; see ADR 0002.
+# `bom` (Mumbai) would be the default because the audience is in India; it is not
+# available on this Fly account, so `sin` is the closest region. See ADR 0002.
 # WebRTC and the WebSocket PCM fallback both ride this single HTTP service.
 
 app = "sarang-gateway"
@@ -19,6 +20,9 @@ kill_timeout = 5
 
 [env]
   SARANG_PROFILE = "bom-india"
+  # Pinned here rather than in a secret so the deployed TTS arm is reviewable in
+  # the repository. ADR 0004 selects Smallest Lightning over Cartesia.
+  TTS_PROVIDER = "smallest"
   # WebRTC needs a TURN server to work behind Fly's private networking; with
   # STUN only, every visitor pays a failed ICE before falling back to the
   # WebSocket PCM path. Until TURN exists, go straight to the transport that
