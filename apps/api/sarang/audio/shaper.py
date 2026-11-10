@@ -146,7 +146,14 @@ class AudioEgress:
             needed = FRAME_SAMPLES if first_for_generation else FRAME_SAMPLES * self._prebuffer_frames
             enough = self.pending_samples() >= needed
             if not enough and not self._residual.size:
-                self.underruns += 1
+                # An underrun means the visitor heard playback stop mid-word.
+                # Before this generation has played anything there is nothing to
+                # stutter: the sender is waiting for the first voiced samples,
+                # and that wait is already measured as `egress`. Counting it here
+                # made every turn report a stutter it did not have, which is how
+                # a real one would hide.
+                if generation in self._first_audio_sent:
+                    self.underruns += 1
                 frame = silent_frame(FRAME_SAMPLES)
             else:
                 frame = self._next_chunk_frame()

@@ -119,6 +119,13 @@ class TurnMarks:
             self.answer_first_audio = now()
 
 
+# `tts_ttfa` and `egress` split one provider-side wait, and the split is not
+# meaningful to the product. `tts_ttfa` ends when the first synthesized span
+# arrives; `egress` then runs until a span carrying a phoneme arrives, because
+# the first span is dead air and is discarded. Read `egress` alone and it looks
+# like framework overhead, which it is not: the gateway's handoff is under 10 ms
+# (see `test_first_frame_of_a_generation_is_not_paced`). What the visitor
+# experiences is the sum, "TTS request -> first audible sample".
 STAGE_ORDER = (
     "endpoint",
     "asr_final",

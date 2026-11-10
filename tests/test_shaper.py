@@ -163,6 +163,35 @@ def test_trim_drops_a_wholly_silent_chunk():
     assert trim_leading_silence(np.zeros(0, dtype=np.int16)).size == 0
 
 
+async def test_waiting_for_the_first_voiced_samples_is_not_an_underrun():
+    """Underruns must mean a stutter, or a real one cannot be found.
+
+    Dropping the TTS's leading dead air leaves the sender with nothing to play
+    for a frame or two, which is expected, already measured as `egress`, and not
+    something the visitor hears as a break.
+    """
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(pcm(1_660, 0), 1, "trn_1")  # entirely inaudible, dropped
+
+    assert not (await egress.next_frame()).any()
+    assert egress.underruns == 0
+
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+    assert (await egress.next_frame()).any()
+    assert egress.underruns == 0
+
+
+async def test_a_starved_sender_mid_utterance_is_an_underrun():
+    egress = AudioEgress(prebuffer_ms=40)
+    egress.set_generation(1)
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+    assert (await egress.next_frame()).any()
+
+    assert not (await egress.next_frame()).any()
+    assert egress.underruns == 1
+
+
 async def test_first_chunk_loses_leading_dead_air():
     """The TTS puts ~35 ms of silence before the first phoneme; it is not audio."""
     from sarang.audio.frames import FRAME_SAMPLES as samples_per_frame
@@ -198,12 +227,13 @@ async def test_pauses_after_audio_has_started_are_preserved():
     assert egress.pending_samples() == before + 960
 
 
-async def test_underrun_is_counted_and_silent():
+async def test_a_frame_before_any_audio_is_silent_and_not_an_underrun():
+    """There is nothing to stutter yet; `egress` measures this wait instead."""
     egress = AudioEgress()
     egress.set_generation(1)
     frame = await egress.next_frame()
     assert not frame.any()
-    assert egress.underruns == 1
+    assert egress.underruns == 0
 
 
 async def test_drain_snapshot_reports_pending_ms():
