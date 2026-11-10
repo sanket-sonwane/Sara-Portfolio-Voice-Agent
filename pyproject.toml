@@ -1,0 +1,49 @@
+[project]
+name = "sarang"
+version = "0.1.0"
+description = "Real-time browser voice agent for a technical portfolio"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "websockets>=15",
+    "numpy>=2.1",
+    "soxr>=0.5",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "pydantic>=2.9",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.6",
+    "aiortc>=1.10",
+    "av>=13",
+]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+# Tier-2 retrieval store. Optional: the app falls back to local BM25 without it.
+pg = [
+    "asyncpg>=0.30",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008", "E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["apps/api"]
+filterwarnings = ["ignore::DeprecationWarning"]
