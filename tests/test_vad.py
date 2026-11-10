@@ -59,3 +59,36 @@ def test_reset_clears_state():
     vad.reset()
     assert not vad.active
     assert vad._speech_ms == 0.0
+
+
+def _frames_to_end(vad: Vad, limit: int = 100) -> float | None:
+    """Push silence until the turn ends and report how much silence it took."""
+    elapsed = 0.0
+    for _ in range(limit):
+        update = vad.push(silence(20))
+        elapsed += 20.0
+        if update.speech_ended:
+            return elapsed
+    return None
+
+
+def test_endpoint_is_measured_from_the_last_speech_frame():
+    """The hangover is a floor, not an extra delay on top of the silence window.
+
+    Counting them in series made ENDPOINT_SILENCE_MS=800 behave like 1 050 ms.
+    """
+    vad = Vad(VadConfig(min_speech_ms=60, silence_ms=200, hangover_ms=240))
+    for _ in range(6):
+        vad.push(tone(20))
+    assert vad.active
+
+    assert _frames_to_end(vad) == 240.0
+
+
+def test_silence_window_longer_than_hangover_ends_at_the_silence_window():
+    vad = Vad(VadConfig(min_speech_ms=60, silence_ms=400, hangover_ms=100))
+    for _ in range(6):
+        vad.push(tone(20))
+    assert vad.active
+
+    assert _frames_to_end(vad) == 400.0

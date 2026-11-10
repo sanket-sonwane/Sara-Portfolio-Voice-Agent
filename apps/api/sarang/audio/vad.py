@@ -8,6 +8,12 @@ the dominant cost anyway.
 The timings are the product. ``silence_ms`` is how long we wait after speech stops
 before deciding the turn is over, and it is the single biggest term in the latency
 budget. 700 ms is conversational; 500 ms starts cutting people off mid-thought.
+
+``silence_ms`` is measured **from the last frame above threshold**, not from the
+end of the hangover. Counting them in series made ``ENDPOINT_SILENCE_MS=800``
+behave like 1 050 ms once the 250 ms hangover was added, which was 250 ms of pure
+latency nobody had budgeted. The hangover survives only as a floor: it stops a
+configuration with a very short ``silence_ms`` from clipping soft word endings.
 """
 
 from __future__ import annotations
@@ -113,15 +119,20 @@ class Vad:
                 self._hangover_ms = 0.0
                 self._speech_ms += step_ms
             else:
+                # Both clocks run from the last frame above threshold. Running
+                # them in series made the effective endpoint
+                # ``hangover_ms + silence_ms``, which is not what any operator
+                # reading ENDPOINT_SILENCE_MS expects.
                 self._hangover_ms += step_ms
-                if self._hangover_ms >= self.config.hangover_ms:
-                    self._silence_ms += step_ms
+                self._silence_ms += step_ms
 
             if not self._partial_sent and self._speech_ms >= self.config.partial_after_ms:
                 self._partial_sent = True
                 update.partial_due = True
 
-            if self._silence_ms >= self.config.silence_ms:
+            if self._silence_ms >= max(
+                self.config.silence_ms, self.config.hangover_ms
+            ):
                 update.speech_ended = True
                 self.active = False
                 self._speech_ms = 0.0
