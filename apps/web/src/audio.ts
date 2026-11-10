@@ -1,0 +1,531 @@
+/**
+ * Browser audio engine.
+ *
+ * Two transports, one audio contract:
+ *
+ * * WebSocket fallback — PCM16 mono at the device capture rate up, 48 kHz down
+ *   in 20 ms frames. The gateway resamples to 16 kHz for the recogniser.
+ * * WebRTC — Opus both ways, with the same server-side framing guarantees.
+ *
+ * The playback side is deliberately strict. Every inbound frame is scheduled on
+ * a monotonic audio clock; a flush stops every scheduled source and ducks the
+ * gain for the server's 80 ms guard, so a barge-in can never produce overlapping
+ * old and new speech.
+ */
+
+import * as api from "./api";
+
+const TRACK_RATE = 48_000;
+const WORKLET_NAME = "sarang-pcm";
+
+interface AudioContextConstructor {
+  new (options?: AudioContextOptions): AudioContext;
+}
+
+function audioContextConstructor(): AudioContextConstructor {
+  const candidate =
+    window.AudioContext ?? (window as unknown as { webkitAudioContext?: AudioContextConstructor }).webkitAudioContext;
+  if (!candidate) throw new Error("This browser does not support the Web Audio API.");
+  return candidate;
+}
+
+/** Linear resampler with state across arbitrary chunk boundaries. */
+export class LinearResampler {
+  private readonly step: number;
+  private buffer = new Float32Array(0);
+  private position = 0;
+
+  constructor(inputRate: number, outputRate: number) {
+    this.step = inputRate / outputRate;
+  }
+
+  process(input: Float32Array): Float32Array {
+    if (!input.length) return new Float32Array(0);
+    const merged = new Float32Array(this.buffer.length + input.length);
+    merged.set(this.buffer, 0);
+    merged.set(input, this.buffer.length);
+    this.buffer = merged;
+
+    const out: number[] = [];
+    while (this.position + 1 < this.buffer.length) {
+      const index = Math.floor(this.position);
+      const fraction = this.position - index;
+      const a = this.buffer[index];
+      const b = this.buffer[index + 1];
+      out.push(a * (1 - fraction) + b * fraction);
+      this.position += this.step;
+    }
+
+    const consumed = Math.floor(this.position);
+    if (consumed > 0) {
+      this.buffer = this.buffer.slice(consumed);
+      this.position -= consumed;
+    }
+    return Float32Array.from(out);
+  }
+
+  reset(): void {
+    this.buffer = new Float32Array(0);
+    this.position = 0;
+  }
+}
+
+export function floatToInt16(samples: Float32Array): Int16Array {
+  const out = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) {
+    const value = Math.max(-1, Math.min(1, samples[i]));
+    out[i] = value < 0 ? value * 0x8000 : value * 0x7fff;
+  }
+  return out;
+}
+
+export function int16ToFloat(samples: Int16Array): Float32Array {
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) out[i] = samples[i] / 32768;
+  return out;
+}
+
+export function rms(analyser: AnalyserNode): number {
+  const data = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 1) sum += data[i] * data[i];
+  return Math.sqrt(sum / data.length);
+}
+
+// ---------------------------------------------------------------- microphone
+
+export interface MicrophoneHandle {
+  stream: MediaStream;
+  context: AudioContext;
+  analyser: AnalyserNode;
+  /** Native capture rate. Sent to the gateway so it resamples once, properly. */
+  sampleRate: number;
+  stop: () => Promise<void>;
+}
+
+export async function openMicrophone(
+  onPcm: (pcm: Int16Array) => void,
+): Promise<MicrophoneHandle> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("Microphone capture is not available in this browser.");
+  }
+
+  // Device DSP is a real ASR variable: aggressive noise suppression can chew
+  // up fricatives on some Windows drivers. `?dsp=off` disables all three so the
+  // diagnostics can A/B the raw microphone.
+  const dsp = new URLSearchParams(window.location.search).get("dsp") !== "off";
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: dsp,
+      noiseSuppression: dsp,
+      autoGainControl: dsp,
+    },
+    video: false,
+  });
+
+  // Capture at the device rate and let the gateway resample with soxr. Forcing
+  // a 16 kHz AudioContext makes the browser resample the mic stream with an
+  // unspecified filter, and the old hand-written linear decimator had no
+  // anti-alias filter at all: sibilants folded back into the formant band and
+  // the recogniser heard noise where the consonants were.
+  const AudioContextClass = audioContextConstructor();
+  const context = new AudioContextClass({ latencyHint: "interactive" });
+  if (context.state === "suspended") {
+    // Not fatal: the graph still starts, and the widget offers a resume gesture.
+    await context.resume().catch(() => undefined);
+  }
+
+  const source = context.createMediaStreamSource(stream);
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.6;
+  const silent = context.createGain();
+  silent.gain.value = 0;
+  source.connect(analyser);
+  analyser.connect(silent);
+  silent.connect(context.destination);
+
+  const chunk = Math.max(160, Math.round(context.sampleRate * 0.02));
+  let pending: number[] = [];
+  let closed = false;
+
+  const emit = (frame: Float32Array) => {
+    if (closed) return;
+    for (let i = 0; i < frame.length; i += 1) pending.push(frame[i]);
+    while (pending.length >= chunk) {
+      const slice = pending.slice(0, chunk);
+      pending = pending.slice(chunk);
+      onPcm(floatToInt16(Float32Array.from(slice)));
+    }
+  };
+
+  let node: AudioNode | null = null;
+  let processor: ScriptProcessorNode | null = null;
+  let worklet: AudioWorkletNode | null = null;
+
+  try {
+    const workletUrl = new URL("pcm-worklet.js", window.location.href).toString();
+    await context.audioWorklet.addModule(workletUrl);
+    worklet = new AudioWorkletNode(context, WORKLET_NAME, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    worklet.port.onmessage = (event: MessageEvent<Float32Array>) => emit(event.data);
+    node = worklet;
+  } catch {
+    // Older Safari and some embedded webviews have no AudioWorklet. The
+    // deprecated script processor is a worse path, not a broken one.
+    processor = context.createScriptProcessor(1024, 1, 1);
+    processor.onaudioprocess = (event) => {
+      emit(event.inputBuffer.getChannelData(0).slice(0));
+    };
+    node = processor;
+  }
+
+  source.connect(node);
+  node.connect(silent);
+
+  const stop = async () => {
+    if (closed) return;
+    closed = true;
+    if (worklet) worklet.port.onmessage = null;
+    if (processor) processor.onaudioprocess = null;
+    try {
+      source.disconnect();
+      node?.disconnect();
+      silent.disconnect();
+      analyser.disconnect();
+    } catch {
+      // A disconnected graph is already the desired state.
+    }
+    for (const track of stream.getTracks()) track.stop();
+    await context.close().catch(() => undefined);
+  };
+
+  return { stream, context, analyser, sampleRate: context.sampleRate, stop };
+}
+
+// ------------------------------------------------------------------ playback
+
+export class Playback {
+  readonly context: AudioContext;
+  readonly analyser: AnalyserNode;
+  private readonly gain: GainNode;
+  private readonly sources = new Set<AudioBufferSourceNode>();
+  private readonly resampler: LinearResampler;
+  private playhead = 0;
+  private closed = false;
+
+  constructor() {
+    const AudioContextClass = audioContextConstructor();
+    try {
+      this.context = new AudioContextClass({ latencyHint: "interactive", sampleRate: TRACK_RATE });
+    } catch {
+      this.context = new AudioContextClass({ latencyHint: "interactive" });
+    }
+    this.gain = this.context.createGain();
+    this.gain.gain.value = 1;
+    this.analyser = this.context.createAnalyser();
+    this.analyser.fftSize = 512;
+    this.analyser.smoothingTimeConstant = 0.55;
+    this.gain.connect(this.analyser);
+    this.analyser.connect(this.context.destination);
+    this.resampler = new LinearResampler(TRACK_RATE, this.context.sampleRate);
+  }
+
+  async resume(): Promise<void> {
+    if (this.closed) return;
+    if (this.context.state !== "running") {
+      await this.context.resume().catch(() => undefined);
+    }
+  }
+
+  get running(): boolean {
+    return !this.closed && this.context.state === "running";
+  }
+
+  enqueue(pcm: Int16Array): void {
+    if (this.closed || !pcm.length) return;
+    let samples = int16ToFloat(pcm);
+    if (this.context.sampleRate !== TRACK_RATE) {
+      samples = this.resampler.process(samples);
+    }
+    if (!samples.length) return;
+
+    const buffer = this.context.createBuffer(1, samples.length, this.context.sampleRate);
+    buffer.copyToChannel(samples as Float32Array<ArrayBuffer>, 0);
+
+    const source = this.context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.gain);
+
+    const now = this.context.currentTime;
+    if (this.playhead < now + 0.01) {
+      // A small fixed lead absorbs scheduling jitter without adding perceptible
+      // latency once playback is under way.
+      this.playhead = now + 0.05;
+    }
+    source.start(this.playhead);
+    this.playhead += buffer.duration;
+    this.sources.add(source);
+    source.onended = () => this.sources.delete(source);
+  }
+
+  /** Stop everything already scheduled and duck output for the flush guard. */
+  flush(guardMs = 110): void {
+    if (this.closed) return;
+    for (const source of this.sources) {
+      try {
+        source.stop();
+      } catch {
+        // Already ended.
+      }
+    }
+    this.sources.clear();
+    this.playhead = 0;
+    const now = this.context.currentTime;
+    const gain = this.gain.gain;
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(0, now);
+    gain.linearRampToValueAtTime(1, now + guardMs / 1000);
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    for (const source of this.sources) {
+      try {
+        source.stop();
+      } catch {
+        // Already ended.
+      }
+    }
+    this.sources.clear();
+    await this.context.close().catch(() => undefined);
+  }
+}
+
+/** Force a MediaStream through an analyser without making it audible twice. */
+export function analyserForStream(
+  context: AudioContext,
+  stream: MediaStream,
+): { analyser: AnalyserNode; stop: () => void } {
+  const source = context.createMediaStreamSource(stream);
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.55;
+  const silent = context.createGain();
+  silent.gain.value = 0;
+  source.connect(analyser);
+  analyser.connect(silent);
+  silent.connect(context.destination);
+  return {
+    analyser,
+    stop: () => {
+      try {
+        source.disconnect();
+        analyser.disconnect();
+        silent.disconnect();
+      } catch {
+        // Already disconnected.
+      }
+    },
+  };
+}
+
+// -------------------------------------------------------------- PCM fallback
+
+export interface PcmSocketHandlers {
+  onOpen?: () => void;
+  onClose?: (event: CloseEvent) => void;
+  onError?: (error: Event) => void;
+  onAudio: (pcm: Int16Array) => void;
+}
+
+export class PcmSocket {
+  private socket: WebSocket | null = null;
+  private closed = false;
+
+  constructor(
+    private readonly url: string,
+    private readonly handlers: PcmSocketHandlers,
+  ) {}
+
+  open(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(this.url);
+      socket.binaryType = "arraybuffer";
+      this.socket = socket;
+      let settled = false;
+
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error);
+        else resolve();
+      };
+
+      socket.onopen = () => {
+        settle();
+        this.handlers.onOpen?.();
+      };
+      socket.onmessage = (event) => {
+        if (typeof event.data === "string") return;
+        if (event.data instanceof ArrayBuffer) {
+          this.handlers.onAudio(new Int16Array(event.data));
+        }
+      };
+      socket.onerror = (event) => {
+        this.handlers.onError?.(event);
+        settle(new Error("The audio channel could not be opened."));
+      };
+      socket.onclose = (event) => {
+        this.socket = null;
+        settle(new Error("The audio channel closed before it was ready."));
+        if (!this.closed) this.handlers.onClose?.(event);
+      };
+    });
+  }
+
+  send(pcm: Int16Array): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !pcm.length) return;
+    socket.send(pcm.buffer);
+  }
+
+  close(): void {
+    this.closed = true;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket && socket.readyState <= WebSocket.OPEN) {
+      try {
+        socket.close();
+      } catch {
+        // Closing a closing socket is harmless.
+      }
+    }
+  }
+}
+
+// -------------------------------------------------------------------- WebRTC
+
+export interface RtcHandle {
+  pc: RTCPeerConnection;
+  stream: MediaStream;
+  close: () => void;
+}
+
+export interface RtcOptions {
+  sessionId: string;
+  token: string;
+  iceServers: RTCIceServer[];
+  forceRelay: boolean;
+  microphone: MediaStream | null;
+  remoteAudio: HTMLAudioElement | null;
+  onRemoteStream?: (stream: MediaStream) => void;
+  onStateChange?: (state: RTCPeerConnectionState) => void;
+}
+
+function waitForIce(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(done, timeoutMs);
+    function done() {
+      window.clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", check);
+      resolve();
+    }
+    function check() {
+      if (pc.iceGatheringState === "complete") done();
+    }
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+function waitForConnected(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+  if (pc.connectionState === "connected") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("WebRTC did not connect in time."));
+    }, timeoutMs);
+
+    function cleanup() {
+      window.clearTimeout(timer);
+      pc.removeEventListener("connectionstatechange", check);
+    }
+    function check() {
+      if (pc.connectionState === "connected") {
+        cleanup();
+        resolve();
+      } else if (pc.connectionState === "failed") {
+        cleanup();
+        reject(new Error("WebRTC negotiation failed."));
+      }
+    }
+    pc.addEventListener("connectionstatechange", check);
+  });
+}
+
+export async function connectWebRTC(options: RtcOptions): Promise<RtcHandle> {
+  const pc = new RTCPeerConnection({
+    iceServers: options.iceServers,
+    iceTransportPolicy: options.forceRelay ? "relay" : "all",
+  });
+
+  const remote = new MediaStream();
+  pc.ontrack = (event) => {
+    const stream = event.streams[0] ?? new MediaStream([event.track]);
+    for (const track of stream.getTracks()) {
+      if (!remote.getTracks().includes(track)) remote.addTrack(track);
+    }
+    if (options.remoteAudio) {
+      options.remoteAudio.srcObject = remote;
+      options.remoteAudio.autoplay = true;
+      void options.remoteAudio.play().catch(() => undefined);
+    }
+    options.onRemoteStream?.(remote);
+  };
+  pc.onconnectionstatechange = () => options.onStateChange?.(pc.connectionState);
+
+  for (const track of options.microphone?.getAudioTracks() ?? []) {
+    pc.addTrack(track, options.microphone as MediaStream);
+  }
+
+  const close = () => {
+    try {
+      pc.close();
+    } catch {
+      // Already closed.
+    }
+    if (options.remoteAudio) {
+      options.remoteAudio.srcObject = null;
+    }
+  };
+
+  try {
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc, 1_500);
+    const local = pc.localDescription;
+    if (!local) throw new Error("WebRTC produced no local description.");
+    const answer = await api.offer(options.sessionId, options.token, local.sdp, local.type);
+    await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+    await waitForConnected(pc, 5_000);
+    return { pc, stream: remote, close };
+  } catch (error) {
+    close();
+    throw error;
+  }
+}
+
+export function silenceElement(element: HTMLAudioElement | null, guardMs = 160): void {
+  if (!element) return;
+  element.muted = true;
+  window.setTimeout(() => {
+    if (element) element.muted = false;
+  }, guardMs);
+}
