@@ -333,17 +333,33 @@ measured 1 652 ms p50 in the same session. The change itself is pinned by
 `tests/test_vad.py`, which asserts an 800 ms window ends a turn at 800 ms and not
 at 1 050 ms.
 
-Egress is the one component that did not clearly improve on Fly (58 → 74 ms) even
-though the same code measures 79 → 31 ms on loopback. The shaper's handoff is
-sub-millisecond in isolation, so the remaining time is the 20 ms frame cadence
-plus event-loop scheduling on a `shared-cpu-2x` machine, and the 8-run p95 (112 ms)
-is wider than the change. It stays on the list as a small, real cost rather than
-being declared fixed.
+Egress did not improve on Fly in that window (58 → 74 ms) even though the same
+code measures 79 → 31 ms on loopback, and the cause is not the event loop. The
+first synthesized span is entirely inaudible and is now discarded, so the egress
+cannot emit a frame until the span carrying the first phoneme arrives: `egress`
+measures the provider's gap between its first and second chunk, not work the
+gateway does. The gateway's own handoff is bounded by
+`test_first_frame_of_a_generation_is_not_paced` (< 10 ms), and a generation's
+first frame is explicitly not paced. The split between `tts_ttfa` and `egress` is
+an artifact of when the provider chunks; what the visitor experiences is their
+sum, 258 ms on loopback and 293–319 ms from `sin`. There is nothing to reclaim
+there, so the item is closed rather than deferred.
+
+A related instrumentation defect is fixed at the same time. Silent frames emitted
+while waiting for the first voiced samples were counted as `underruns`, so after
+the dead-air trim every turn reported a stutter it did not have. An underrun now
+only counts once a generation has played something, which is the only case where
+the visitor can hear playback stop.
 
 What is left, in order: endpointing (800 ms, deliberate — ADR 0003 §1), LLM TTFT
-(~400 ms), TTS TTFA (~245 ms), ASR finalization (~175 ms). Nothing in that list
-is ours to optimise without either changing a provider or accepting a quality
-trade the ADR rejected.
+(~400 ms, provider), TTS request → first audible sample (~260–320 ms, provider
+chunk cadence), ASR finalization (~175 ms, provider). Nothing in that list is
+ours to optimise without either changing a provider or accepting a quality trade
+the ADR rejected. The one remaining idea that is not provider-bound is
+finalizing the recogniser before the endpointing window expires; it is only safe
+if a resumed utterance can be replayed to the recogniser in full, which is a
+project rather than an optimisation, and it is not started without evidence that
+its ~175 ms is worth the accuracy risk.
 
 ## 7. Risks confirmed or retired
 
