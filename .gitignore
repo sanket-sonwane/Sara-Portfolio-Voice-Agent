@@ -1,0 +1,33 @@
+# secrets
+.env
+.env.local
+*.pem
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# node
+node_modules/
+.vite/
+dist-web/
+
+# probe output and generated audio
+bench/results/
+bench/asr-dumps/
+bench/*.log
+bench/audio/*.wav
+!bench/audio/.gitkeep
+
+# runtime caches (filler audio is regenerated on demand)
+cache/
+
+# os
+.DS_Store
+Thumbs.db
