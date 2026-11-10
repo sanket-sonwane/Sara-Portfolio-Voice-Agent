@@ -4,6 +4,28 @@ import { createRoot } from "react-dom/client";
 import { SarangWidget } from "./SarangWidget";
 import "./styles.css";
 
+type Theme = "light" | "dark";
+
+const params = new URLSearchParams(window.location.search);
+const embed = params.get("embed") === "1";
+const themeParam = params.get("theme");
+const theme: Theme | undefined = themeParam === "light" || themeParam === "dark" ? themeParam : undefined;
+
+/**
+ * Embedded surface.
+ *
+ * `?embed=1` drops the standalone header/footer so the widget is the whole
+ * document — the portfolio supplies the panel chrome (frame, close button,
+ * connecting overlay) and the widget supplies the conversation UI.
+ */
+function Embed() {
+  return (
+    <main className="sarang-embed-surface">
+      <SarangWidget mode="inline" appearance="embed" theme={theme} />
+    </main>
+  );
+}
+
 /**
  * Standalone surface.
  *
@@ -39,11 +61,11 @@ function Standalone() {
   );
 }
 
+if (embed) {
+  document.documentElement.dataset.sarangTheme = theme ?? "light";
+}
+
 const container = document.getElementById("root");
 if (container) {
-  createRoot(container).render(
-    <StrictMode>
-      <Standalone />
-    </StrictMode>,
-  );
+  createRoot(container).render(<StrictMode>{embed ? <Embed /> : <Standalone />}</StrictMode>);
 }

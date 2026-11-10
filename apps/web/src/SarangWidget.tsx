@@ -19,6 +19,14 @@ export interface SarangWidgetProps {
   mode?: "floating" | "inline";
   className?: string;
   title?: string;
+  /**
+   * `full` keeps the product chrome (header, hero copy, footer meta, developer
+   * toggles). `embed` is the minimal surface for a host iframe: an orb, one
+   * status line, the last turns, mute/end and a composer.
+   */
+  appearance?: "full" | "embed";
+  /** Palette for the embed surface, so it can match the host page. */
+  theme?: "light" | "dark";
 }
 
 type Tone = "idle" | "good" | "busy" | "warn" | "bad";
@@ -58,6 +66,22 @@ const STARTERS = [
   "Which project was hardest technically?",
   "What are you working on now?",
 ];
+
+/** One short line for the embed surface — the full hints are too long there. */
+const SHORT_HINT: Record<ViewState, string> = {
+  idle: "Tap the orb to start. The microphone opens only then.",
+  permission: "Allow the microphone to talk.",
+  connecting: "Opening the line…",
+  connected: "Go ahead, I'm listening.",
+  listening: "Listening… speak normally, I'll stop when you pause.",
+  processing: "Thinking…",
+  speaking: "Speaking — interrupt me any time.",
+  tool: "Pulling the relevant detail…",
+  interrupted: "Go on.",
+  reconnecting: "Reconnecting…",
+  error: "Something needs your attention.",
+  ended: "Session ended. The microphone is off.",
+};
 
 function formatMs(value: number | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "—";
@@ -352,7 +376,8 @@ function Diagnostics({ sarang }: { sarang: UseSarang }) {
 
 // -------------------------------------------------------------------- widget
 
-export function SarangWidget({ mode = "floating", className, title = "Sara" }: SarangWidgetProps) {
+export function SarangWidget({ mode = "floating", className, title = "Sara", appearance = "full", theme }: SarangWidgetProps) {
+  const embed = appearance === "embed";
   const remoteAudio = useRef<HTMLAudioElement | null>(null);
   const sarang = useSarang(remoteAudio);
   const [open, setOpen] = useState(mode === "inline");
@@ -376,6 +401,28 @@ export function SarangWidget({ mode = "floating", className, title = "Sara" }: S
     return null;
   }, [transcript]);
 
+  // The embed surface shows only the tail of the conversation.
+  const recentTurns = useMemo(() => transcript.slice(-2), [transcript]);
+
+  /** Talk to the host page (the portfolio) without trusting random senders. */
+  const postToParent = useCallback((message: Record<string, unknown>) => {
+    if (window.parent === window) return;
+    let target = "*";
+    try {
+      if (document.referrer) target = new URL(document.referrer).origin;
+    } catch {
+      target = "*";
+    }
+    window.parent.postMessage(message, target);
+  }, []);
+
+  // The host shows its own "Connecting" overlay. Release it once a session is
+  // actually live, so nobody stares at a spinner over a working orb.
+  useEffect(() => {
+    if (!embed || !active) return;
+    postToParent({ type: "sara:ready" });
+  }, [active, embed, postToParent]);
+
   useEffect(() => {
     if (!open) return;
     const node = transcriptRef.current;
@@ -392,10 +439,10 @@ export function SarangWidget({ mode = "floating", className, title = "Sara" }: S
   }, [active, micReady]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || embed) return;
     const node = panelRef.current;
     if (node && typeof node.focus === "function") node.focus({ preventScroll: true });
-  }, [open]);
+  }, [open, embed]);
 
   useEffect(() => {
     if (!open) return;
@@ -453,6 +500,13 @@ export function SarangWidget({ mode = "floating", className, title = "Sara" }: S
     sarang.stop();
     if (mode === "floating") setOpen(false);
   }, [mode, sarang]);
+
+  // In the embed surface "end" belongs to the host: stop the audio here and ask
+  // the portfolio to close its panel.
+  const endEmbed = useCallback(() => {
+    sarang.stop();
+    postToParent({ type: "sara:end" });
+  }, [postToParent, sarang]);
 
   const errorActions = useCallback(
     (current: UiError) => {
@@ -643,7 +697,7 @@ export function SarangWidget({ mode = "floating", className, title = "Sara" }: S
     </>
   );
 
-  const panel = (
+  const fullPanel = (
     <section
       ref={panelRef}
       tabIndex={-1}
@@ -754,8 +808,184 @@ export function SarangWidget({ mode = "floating", className, title = "Sara" }: S
     </section>
   );
 
+  const embedPanel = (
+    <section
+      ref={panelRef}
+      tabIndex={-1}
+      className="sarang-panel sarang-panel-inline sarang-panel-embed is-open"
+      aria-label={`${title} voice assistant`}
+    >
+      <div className="sarang-embed-scroll">
+        {error && (
+          <div className="sarang-embed-error" role="alert">
+            <p>{error.message}</p>
+            {errorActions(error)}
+          </div>
+        )}
+
+        <div className="sarang-embed-status">
+          <span className={`sarang-embed-dot sarang-tone-${copy.tone}${active ? " is-live" : ""}`} aria-hidden="true" />
+          <span aria-live="polite">{copy.label}</span>
+        </div>
+
+        <div className="sarang-embed-center">
+          {active ? (
+            <div
+              className={`sarang-embed-orb sarang-tone-${copy.tone}${speaking ? " is-speaking" : ""}${busy ? " is-busy" : ""}`}
+              aria-hidden="true"
+            >
+              <span className="sarang-embed-orb-core">
+                <Icon path={ICONS.wave} size={28} />
+              </span>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="sarang-embed-orb is-button"
+              onClick={startVoice}
+              aria-label={`Start talking to ${title}`}
+            >
+              <span className="sarang-embed-orb-core">
+                <Icon path={ICONS.mic} size={28} />
+              </span>
+            </button>
+          )}
+          {!active && <p className="sarang-embed-hint">{SHORT_HINT[view]}</p>}
+        </div>
+
+        {recentTurns.length > 0 && (
+          <div className="sarang-embed-log" role="log" aria-label="Recent conversation">
+            {recentTurns.map((entry) => (
+              <p
+                key={entry.id}
+                className={`sarang-embed-line sarang-embed-line-${entry.role}${entry.partial ? " is-partial" : ""}`}
+              >
+                {entry.text}
+                {entry.partial && <span className="sarang-caret" aria-hidden="true" />}
+              </p>
+            ))}
+            {ended && <p className="sarang-embed-line is-note">Session ended — the microphone is off.</p>}
+          </div>
+        )}
+
+        {speaking && (
+          <div className="sarang-embed-meter">
+            <Waveform
+              tone="output"
+              active
+              colour={theme === "light" ? "#d9482a" : "#ffb199"}
+              label="Sara"
+              getAnalysers={sarang.getAnalysers}
+              level={1}
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="sarang-embed-bottom">
+        {notice && (
+          <div className={`sarang-notice sarang-notice-${notice.level}`} role="status">
+            <p>{notice.message}</p>
+            <button
+              type="button"
+              className="sarang-icon-btn"
+              onClick={() => sarang.clearNotice()}
+              aria-label="Dismiss notice"
+            >
+              <Icon path={ICONS.close} size={14} />
+            </button>
+          </div>
+        )}
+
+        {active && !audioRunning && (
+          <button type="button" className="sarang-sound-hint" onClick={() => sarang.resumeAudio()}>
+            <Icon path={ICONS.sound} size={15} />
+            Enable sound
+          </button>
+        )}
+
+        {(active || ended) && (
+          <div className="sarang-embed-controls">
+            {active && micReady && (
+              <button
+                type="button"
+                className={`sarang-embed-control${muted ? " is-on" : ""}`}
+                aria-pressed={muted}
+                aria-label={muted ? "Unmute microphone" : "Mute microphone"}
+                title={muted ? "Unmute microphone" : "Mute microphone"}
+                onClick={() => sarang.toggleMute()}
+              >
+                <Icon path={muted ? ICONS.micOff : ICONS.mic} size={18} />
+                {muted ? "Unmute" : "Mute"}
+              </button>
+            )}
+            {active && (
+              <button
+                type="button"
+                className="sarang-embed-control is-end"
+                aria-label="End voice session"
+                title="End session"
+                onClick={endEmbed}
+              >
+                <Icon path={ICONS.end} size={18} />
+                End
+              </button>
+            )}
+            {ended && (
+              <button type="button" className="sarang-embed-control is-restart" onClick={startVoice}>
+                <Icon path={ICONS.spark} size={16} />
+                Start again
+              </button>
+            )}
+          </div>
+        )}
+
+        <form className="sarang-composer" onSubmit={submit}>
+          <input
+            ref={inputRef}
+            type="text"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder={active ? "Ask anything" : "Type instead of speaking"}
+            aria-label="Type a question for Sara"
+            autoComplete="off"
+            enterKeyHint="send"
+          />
+          <button type="submit" className="sarang-send" aria-label="Send question" disabled={!draft.trim()}>
+            <Icon path={ICONS.send} />
+          </button>
+        </form>
+
+        {!active && transcript.length === 0 && (
+          <div className="sarang-starters" aria-label="Suggested questions">
+            {STARTERS.slice(0, 3).map((question) => (
+              <button key={question} type="button" className="sarang-chip" onClick={() => void send(question)}>
+                {question}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="sarang-sr-only" role="status" aria-live="polite">
+        {`${copy.label}. ${error ? error.message : copy.hint}`}
+      </div>
+
+      <audio ref={remoteAudio} className="sarang-remote-audio" />
+    </section>
+  );
+
+  const panel = embed ? embedPanel : fullPanel;
+
   if (mode === "inline") {
-    return <div className={`sarang-widget sarang-widget-inline ${className ?? ""}`}>{panel}</div>;
+    return (
+      <div
+        className={`sarang-widget sarang-widget-inline${embed ? " sarang-embed" : ""} ${className ?? ""}`}
+        data-theme={theme}
+      >
+        {panel}
+      </div>
+    );
   }
 
   return (
