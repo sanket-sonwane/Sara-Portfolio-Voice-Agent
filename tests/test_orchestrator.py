@@ -3,9 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
+from sarang.orchestrator import filler_voice_tag
 from sarang.schemas import Envelope
+
+
+def test_filler_cache_is_keyed_by_provider_and_voice():
+    """Switching TTS arm must not reuse the previous voice's cached fillers."""
+    smallest = SimpleNamespace(
+        name="smallest", model="lightning_v3.1_pro", voice_id="rhea", language="hi"
+    )
+    cartesia = SimpleNamespace(
+        name="cartesia", model="sonic-latest", voice_id="ella", language="en"
+    )
+
+    assert filler_voice_tag(smallest) == "smallest-lightning_v3.1_pro-rhea-hi"
+    assert filler_voice_tag(cartesia) == "cartesia-sonic-latest-ella-en"
+
+
+def test_filler_cache_tag_uses_the_fallback_primary():
+    fallback = SimpleNamespace(
+        name="smallest",
+        primary=SimpleNamespace(model="m", voice_id="rhea", language="hi"),
+    )
+
+    assert filler_voice_tag(fallback) == "smallest-m-rhea-hi"
 
 
 async def collect(queue: asyncio.Queue[Envelope], wanted: str, timeout: float = 8.0) -> list[Envelope]:

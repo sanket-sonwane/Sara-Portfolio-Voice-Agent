@@ -63,6 +63,28 @@ class _StreamError:
     error: BaseException
 
 
+def filler_voice_tag(tts: TTS) -> str:
+    """Identity of the audio a TTS arm produces; used to key cached fillers.
+
+    A cached clip is only valid for the exact voice that rendered it, so the tag
+    names everything that changes the audio: provider, model, voice and language.
+    Without it, switching provider leaves the old voice saying "one moment" ahead
+    of an answer spoken in the new one.
+    """
+    primary = getattr(tts, "primary", tts)
+    voice = getattr(primary, "voice_id", "") or getattr(primary, "voice", "")
+    return "-".join(
+        str(part)
+        for part in (
+            tts.name,
+            getattr(primary, "model", ""),
+            voice,
+            getattr(primary, "language", ""),
+        )
+        if part
+    )
+
+
 class OrderedSpeech:
     """Synthesise segments concurrently, play them strictly in order.
 
@@ -228,13 +250,11 @@ class Orchestrator:
         self.tools = ToolRunner()
         self.metrics = MetricsStore()
         cache_root = Path(settings.cache_dir) if settings.cache_dir else REPO_ROOT / "cache"
-        primary_tts = getattr(self.tts, "primary", self.tts)
-        voice = getattr(primary_tts, "voice_id", "") or getattr(primary_tts, "voice", "")
         self.filler = FillerBank(
             self.tts,
             cache_root / "fillers",
             enabled=settings.filler_enabled,
-            voice_tag=f"{self.tts.name}-{voice}",
+            voice_tag=filler_voice_tag(self.tts),
         )
         self.filler_after_s = max(0.35, settings.speculative_ms / 1000.0 or 0.6)
         self.ready = False
