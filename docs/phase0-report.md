@@ -83,6 +83,12 @@ compare. The earlier plan to default to Gemini on the strength of `asia-south1`
 is retired: the measurement did not support it, and the free tier also throttles
 (see §7).
 
+**No smaller in-region arm exists.** The obvious "is a smaller model faster"
+experiment is closed by the catalogue: this account's `GET /v1/models` lists only
+`sarvam-105b` and `sarvam-105b-conversations`, and `sarvam-30b` returns HTTP 400.
+The remaining candidates are US-hosted, which ADR 0002 rules out for the
+India-first profile, and both measured slower anyway.
+
 ## 4. TTS — Smallest Lightning (default), Cartesia Sonic (comparison)
 
 Voice pinned: `rhea`, model `lightning_v3.1_pro`, `language: "hi"` — Indian-accented
@@ -271,6 +277,73 @@ Where the budget is lost, in order of expected gain:
 Run-to-run spread is large, and a 2-turn sample cannot separate p50 from p95, so
 treat any single-run comparison as noise. The JSON is
 `bench/results/e2e-turn-local-india-20261110-121439.json`.
+
+### Latency pass 2 — the endpointing clock was charging 1 050 ms, not 800
+
+Four defects were found while re-reading the budget, all of them structural
+rather than provider variance:
+
+1. **Endpointing ran the hangover and the silence window in series** in
+   `audio/vad.py`. `ENDPOINT_SILENCE_MS=800` therefore ended turns 1 050 ms after
+   the last speech frame. Both clocks now start at the last frame above
+   threshold and the hangover survives as a floor. This is why the client total
+   and the server EOS figure never reconciled: the missing 250 ms sat in front of
+   the server's clock, where no stage could see it.
+2. **`segment` was measured after the whole model stream finished**, so it
+   reported the rest of the generation (128 ms) under the name of the stage that
+   decides when speech can start, and `llm_ttft + segment ≈ llm_total` hid it. It
+   now closes when the first segment reaches TTS. Not a speed-up (the old 128 ms
+   was double-counted inside `llm_total`), but the budget adds up now.
+3. **Egress held every generation for a 40 ms pre-buffer.** The first frame of a
+   turn is the one the visitor is waiting for and one 20 ms frame is already
+   playable, so it now leaves immediately; later frames keep the pre-buffer.
+4. **The first TTS span is dead air.** Smallest's first span measured 34.6 ms
+   with a peak of 0–6 out of 32 768, and the next span carried another ~16 ms
+   below threshold. Egress counts only frames that are audible, so all of it was
+   charged as latency (measured 79 ms with a handoff that costs under 1 ms).
+   Inaudible leading samples are now dropped before the first audible frame, with
+   10 ms of pre-roll so a breathy onset is never clipped (`bench/probe/tts_leading_silence.py`
+   reproduces the provider number).
+
+Same probe, same machine (`sin`), 8 runs warm, measuring the shipped image:
+
+| Total | Before | After |
+|---|---:|---:|
+| Client: last speech → first audible | 2 230 ms | 2 143 ms |
+| Server: end-of-speech → first audible | 984 ms | 976 ms |
+| Server: end-of-speech → first answer audio | 926 ms | **887 ms** |
+
+| Stage | Before | After | Note |
+|---|---:|---:|---|
+| ASR finalization | 258 | 175 | provider variance, not a code change |
+| Fact lookup | 0.9 | 0.7 | |
+| Context build | 0.0 | 0.0 | |
+| LLM TTFT | 395 | 398 | provider variance |
+| Segmentation | 128 | 32 | same work, measured honestly |
+| TTS TTFA | 234 | 245 | provider variance |
+| Egress reframe | 58 | 74 | see below |
+
+The 250 ms is not visible as a 250 ms drop in the remote client total, for two
+reasons worth stating rather than hiding: the endpointing window is *client-side*
+of end-of-speech, so it can only appear in the client delta (2 230 − 984 = 1 246
+before, 2 143 − 976 = 1 167 after, with ~330 ms of India→`sin` network folded in
+that varies run to run), and LLM TTFT plus TTS TTFA were 45 ms slower in the
+after window. On loopback, where the transport adds nothing, the client total
+measured 1 652 ms p50 in the same session. The change itself is pinned by
+`tests/test_vad.py`, which asserts an 800 ms window ends a turn at 800 ms and not
+at 1 050 ms.
+
+Egress is the one component that did not clearly improve on Fly (58 → 74 ms) even
+though the same code measures 79 → 31 ms on loopback. The shaper's handoff is
+sub-millisecond in isolation, so the remaining time is the 20 ms frame cadence
+plus event-loop scheduling on a `shared-cpu-2x` machine, and the 8-run p95 (112 ms)
+is wider than the change. It stays on the list as a small, real cost rather than
+being declared fixed.
+
+What is left, in order: endpointing (800 ms, deliberate — ADR 0003 §1), LLM TTFT
+(~400 ms), TTS TTFA (~245 ms), ASR finalization (~175 ms). Nothing in that list
+is ours to optimise without either changing a provider or accepting a quality
+trade the ADR rejected.
 
 ## 7. Risks confirmed or retired
 

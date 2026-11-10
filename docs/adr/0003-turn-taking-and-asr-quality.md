@@ -31,6 +31,15 @@ of the next utterance, so the extra wait only costs the 800 ms itself.
 ended. That is the correct place to spend latency: answering a fragment costs a
 whole extra turn.
 
+**Correction (same day).** The implementation made the hangover and the silence
+window run in series, so the configured 800 ms behaved like 1 050 ms and every
+turn paid 250 ms nobody had budgeted. Both clocks now start at the last frame
+above threshold; the hangover remains a floor so a very short `silence_ms`
+cannot clip soft word endings. The decision above is unchanged — the point is
+that the number in the config is now the number charged, which is what the plan
+and the budget both assume. See Phase 0 §6, "Latency pass 2".
+
+
 ## 2. One recogniser socket per connection, not one per utterance
 
 **Decision.** The ASR WebSocket is opened when the transport opens
