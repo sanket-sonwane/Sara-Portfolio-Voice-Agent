@@ -109,3 +109,24 @@ the region: `bom` is provisional until the Fly matrix is filled.
 **Revisit when.** An en-IN Cartesia voice measures within ~20 ms of the current
 one, Sarvam ships a streaming Bulbul, or the Fly matrix shows a non-`bom` region
 wins for an Indian client.
+
+---
+
+## 7. Amendment (2026-11-10) — Smallest Lightning replaces Cartesia
+
+**Status:** accepted. This amends §3 and the TTS row of §6. ADR 0004 carries the
+measurements.
+
+Cartesia's free tier allows **two** concurrent contexts, and the turn engine submits
+one request per answer segment. The third segment was therefore dropped mid-answer,
+which is a structural ceiling, not a tuning problem. Smallest Lightning speaks every
+segment, costs 2.6× less per character, and offers an en-IN voice (`rhea`,
+`language: "hi"`). It is ~30–60 ms slower to first audio from `sin` (216 ms vs
+186 ms), which is smaller than the turn's own run-to-run variance.
+
+The region argument in §3 is now settled the other way for TTS: the accent and the
+concurrency ceiling both point at an Indian provider, so `bom-india` uses Smallest.
+Cartesia is retained for `iad-global` and as a one-env-var comparison arm.
+
+**What does not change.** §1's in-region default, §2's demotion of Groq, and §4's
+rule that the region is decided by measurement.

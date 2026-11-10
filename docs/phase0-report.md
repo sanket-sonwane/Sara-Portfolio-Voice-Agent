@@ -1,6 +1,6 @@
 # Phase 0 — Provider Validation Report
 
-**Status:** local baseline complete — Fly region matrix still pending
+**Status:** complete for `sin`; `bom` unavailable on this Fly account
 **Owner:** Sanket
 **Started:** 2026-11-09
 **Updated:** 2026-11-10
@@ -8,8 +8,9 @@
 Exit criteria: the provider integrations are proven reachable, their latencies are
 measured rather than assumed, the ASR protocol is identified, and the media
 gateway region is chosen from data. The numbers below are from the real adapters
-with real keys, measured from a consumer connection in India. The one gate still
-open is the Fly region matrix (§5), which needs Fly machines.
+with real keys, measured from a consumer connection in India and, for §6, from the
+deployed Fly machine. The one gate still open is the full region matrix (§5):
+`bom` is not available on this account.
 
 ---
 
@@ -19,9 +20,9 @@ open is the Fly region matrix (§5), which needs Fly machines.
 |---|---|
 | Probe host | local — Windows 11, Python 3.12, consumer connection in India |
 | Public location at probe time | IN, colo `MAA` |
-| Provider hosts resolved | Sarvam, Gemini, Groq, Cartesia, NVIDIA |
-| API keys available at last run | all five |
-| Default profile | `bom-india` (ADR 0002, amended) |
+| Provider hosts resolved | Sarvam, Gemini, Groq, Cartesia, Smallest, NVIDIA |
+| API keys available at last run | all six |
+| Default profile | `bom-india` (ADR 0002, amended; ADR 0004 for TTS) |
 
 Every figure in this report is a **local client** measurement. It includes the
 consumer last mile to the provider, so it is an upper bound on what a Fly `bom`
@@ -82,29 +83,71 @@ compare. The earlier plan to default to Gemini on the strength of `asia-south1`
 is retired: the measurement did not support it, and the free tier also throttles
 (see §7).
 
-## 4. TTS — Cartesia Sonic (default), Sarvam Bulbul (comparison)
+## 4. TTS — Smallest Lightning (default), Cartesia Sonic (comparison)
 
-Voice pinned: `2a12b36c-7f9b-4c3a-9f7a-72731b15323a` ("Ella — Caring Scout",
-feminine, en-AU), model `sonic-latest`, 24 kHz.
+Voice pinned: `rhea`, model `lightning_v3.1_pro`, `language: "hi"` — Indian-accented
+English with mid-utterance Hindi code-switching — at 24 kHz PCM16, resampled to the
+48 kHz egress track. `language: "en"` selects the UK/US accents, which is the thing
+this choice is moving away from.
 
-Cartesia is a WebSocket, so the turn engine gets audio as it is generated.
-`cartesia_ttfa.py`, 3 runs / 5 segments:
+Both providers are WebSockets, so the turn engine gets audio while it is generated.
+`cartesia_ttfa.py` and `smallest_ttfa.py` share the same passage, the same
+segmentation and the same metric names, so the two runs compare row for row. Five
+runs of five segments each, one laptop, one session (India, consumer link):
 
-| Metric | Target | Cartesia p50 | Cartesia p95 | Sarvam Bulbul |
-|---|---:|---:|---:|---|
-| TTFA, first segment | < 120 ms | **148 ms** | 204 ms | request/response, not comparable |
-| Subsequent segment TTFA | ≈ first | **5.6 ms** | 56 ms | n/a |
-| RTF | < 1.0 | **0.09** | 0.09 | n/a |
-| Cancel-to-silence | < 100 ms | **65 ms** | 72 ms | n/a (cannot cancel mid-request) |
+| Metric | Target | Cartesia p50 | Cartesia p95 | Smallest p50 | Smallest p95 |
+|---|---:|---:|---:|---:|---:|
+| TTFA, first segment | < 120 ms | **156 ms** | 243 ms | **246 ms** | 293 ms |
+| Subsequent segment TTFA | ≈ first | **4.9 ms** | 62 ms | 259 ms | 314 ms |
+| RTF | < 1.0 | **0.10** | 0.11 | 0.58 | 0.62 |
+| Cancel-to-silence | < 100 ms | 137 ms | 273 ms | **89 ms** | 109 ms |
+
+From the production region (`sin`), single-sentence probe, 5 samples each:
+Cartesia **186 ms** p50 (121–187), Smallest **216 ms** p50 (210–240). TCP RTT
+measured inside a Fly machine is useless here — `api.smallest.ai`,
+`api.cartesia.ai` and Google all answer in 1–2 ms because Fly proxies egress
+locally — so only the full TLS+WebSocket number is trustworthy.
+
+### Why Smallest is the default anyway
+
+The 60 ms production gap is smaller than the turn's own variance (§6) and is not
+the deciding factor:
+
+| | Cartesia Sonic | Smallest Lightning |
+|---|---|---|
+| List price | $0.50 / 10K chars | **$0.195 / 10K chars** (2.6× cheaper) |
+| Free allowance | 20K credits/month, concurrency 2 | $10 ≈ 51K chars, concurrency 10–15 |
+| Accent | en-AU (`Ella`) | **en-IN** (`rhea`, `language: "hi"`) |
+| RTF | 0.10 | 0.58 |
+| Barge-in | in-band cancel, 137 ms | socket close, 89 ms |
+
+The concurrency ceiling is what actually broke: the orchestrator fans out one task
+per answer segment, Cartesia's free tier allows two, and the third segment's audio
+was dropped. That is the origin of `TTS_MAX_CONCURRENCY=2`, and it is a structural
+limit, not a tuning knob. Smallest has room to speak every segment of a 35-word
+answer at once, costs 2.6× less per character, and speaks Indian English — which is
+the audience. Cartesia remains one env var away (`TTS_PROVIDER=cartesia`) and keeps
+the `iad-global` profile, where its lower latency and RTF are worth more than accent.
+
+Two Lightning quirks are worth recording because they are easy to reintroduce:
+
+* **`complete_backoff_ms` defaults to 4 s.** The provider holds `complete` for four
+  seconds after the last audio chunk unless the request asks for `0`. Every request
+  in the adapter and the probe asks for `0`; with the default, RTF measures 2.38
+  instead of 0.58 and every turn looks four seconds slower than it is.
+* **`context_close: true` does not stop audio.** It kept delivering chunks for
+  9.3 s p50 (143–226 late chunks) after the call. Closing the socket stops it in
+  89 ms, so a cancelled context closes its socket instead of returning it to the
+  pool. `continue: true` continuations were also rejected: they buy prosody across
+  segments for +90–160 ms to first audio.
 
 Bulbul is request/response, not a socket. The turn engine compensates by
 synthesising one short segment at a time, so the meaningful number is the first
-segment's time-to-audio, not the whole paragraph — but cancellation is still
-coarse, which is why Cartesia holds the default despite the non-Indian accent.
+segment's time-to-audio — but cancellation is still coarse, which is why it is not
+the default.
 
-**Accepted trade-off:** "Ella" is en-AU, not Indian English. It was chosen for the
-measured TTFA and the clean cancel behaviour; en-IN alternatives were offered and
-remain one env var away (`CARTESIA_VOICE_ID`).
+Full comparison: ADR 0004. Raw JSON: `bench/results/smallest-ttfa-india-en-rhea-20261110-183801.json`
+and `bench/results/cartesia-ttfa-compare-2026-11-10-20261110-183824.json`.
 
 ## 5. Region matrix
 
@@ -123,21 +166,24 @@ surviving conclusion is the one that drove ADR 0002: Groq has no nearby point of
 presence from India, so a `bom` gateway talking to Groq spends ~210 ms of the
 500 ms budget before inference starts.
 
-### Fly measurements (authoritative — **pending**)
+### Fly measurements (partial — `sin` only)
 
-Run `regions.py --full` inside Fly machines, one per candidate region. This has
-not been done: the Fly account is not available in this environment, so the
-matrix below is intentionally empty rather than estimated.
+`bom` is not available on this Fly account, so the matrix cannot be run as
+designed. What was measured inside the deployed machine (`sin`, version 6):
 
-| Region | Sarvam RTT p50 | Cartesia RTT p50 | Groq RTT p50 | Groq TTFT p50 | Public loc |
-|---|---:|---:|---:|---:|---|
-| `bom` | | | | | |
-| `sin` | | | | | |
-| `fra` | | | | | |
-| `iad` | | | | | |
+| Region | Sarvam RTT p50 | Cartesia TTFA p50 | Smallest TTFA p50 | Public loc |
+|---|---:|---:|---:|---|
+| `bom` | unavailable | — | — | Mumbai |
+| `sin` | **55.9 ms** | 186 ms | 216 ms | Singapore |
+| `fra` | not measured | — | — | Frankfurt |
+| `iad` | not measured | — | — | Virginia |
 
-**Decision:** provisional `bom`. Final only when this table is filled and `bom`
-wins end-to-end for an Indian client (ADR 0002 §4).
+`api.sarvam.ai` shows a real 55.9 ms RTT from `sin`, which is consistent with the
+ASR finalisation times in §6. The other hosts cannot be measured by TCP RTT from
+Fly at all (see §4), so their rows hold the WebSocket TTFA instead.
+
+**Decision:** `sin` is the deployed region, provisional. `bom` wins on paper for an
+Indian audience and should be re-tested if the account gains access (ADR 0002 §4).
 
 ## 6. Budget reconciliation
 
@@ -156,6 +202,30 @@ work in ADR 0003:
 Client total includes the **800 ms** endpointing window; server totals start
 after it. The arithmetic closes: 800 ms endpointing + ~1 160 ms of server work
 ≈ 1 960 ms, so on loopback the transport adds nothing measurable.
+
+### Production, same probe against `https://sarang-gateway.fly.dev` (`sin`, Smallest)
+
+| Total | p50 | p95 |
+|---|---:|---:|
+| Client: last speech → first audible | 2 230 ms | 2 296 ms |
+| Server: end-of-speech → first audible | 984 ms | 1 037 ms |
+| Server: end-of-speech → first answer audio | **926 ms** | 978 ms |
+
+| Stage | Measured p50 |
+|---|---:|
+| ASR finalization | 258 ms |
+| Fact lookup | 0.9 ms |
+| Context build | 0.0 ms |
+| LLM TTFT | 395 ms |
+| Segmentation | 128 ms |
+| TTS TTFA | 234 ms |
+| Egress reframe | 58 ms |
+
+The server total improves on the laptop run (926 ms vs 1 123 ms) because the
+machine is closer to the providers than the laptop is, and it is the number the
+product owns. The client total is dominated by the 800 ms endpointing window plus
+the round trip to `sin`; that is the figure a real-mic browser pass has to move.
+JSON: `bench/results/e2e-turn-fly-smallest-20261110-185158.json`.
 
 Server-side components, against the plan's estimates:
 
@@ -208,11 +278,14 @@ treat any single-run comparison as noise. The JSON is
 |---|---|---|
 | Sub-500 ms impossible from India due to provider region | **confirmed for Groq**, mitigated | no Asia region; ADR 0002 moves the default in-region |
 | Gemini free tier is a viable default | **retired — it is not** | 980 ms TTFT p50 and quota throttling; Sarvam is 206 ms |
-| Cartesia leaks audio after cancel | **retired** | 65 ms cancel-to-silence, 18 late chunks measured and dropped |
+| Cartesia leaks audio after cancel | **retired** | 137 ms cancel-to-silence, 18–46 late chunks measured and dropped |
+| Smallest `context_close` stops audio | **retired — it does not** | 9.3 s p50, 143–226 late chunks; the adapter closes the socket instead (89 ms) |
+| Smallest's 4 s `complete` backoff inflates every turn | **retired** | `complete_backoff_ms: 0` on every request; RTF 0.58, not 2.38 |
+| Cartesia concurrency ceiling truncates multi-segment answers | **confirmed, retired by switching** | free tier allows 2 contexts; one task per segment exceeded it |
 | Nemotron streaming access unavailable | open | comparison arm only |
 | aiortc cannot obtain reachable ICE candidates on Fly | open | `/ws/audio` fallback keeps the product working |
 | Prompt length materially increases TTFT | open | `llm_matrix.py` + `groq_ttft.py` measure it |
-| Bulbul request/response adds first-segment latency | **retired by not shipping it** | Cartesia is the default; Bulbul stays an arm |
+| Bulbul request/response adds first-segment latency | **retired by not shipping it** | Smallest is the default; Bulbul stays an arm |
 | pgvector unavailable on the managed plan | mitigated | BM25 is the default; pg is opt-in |
 
 ## 8. Decisions required before production
@@ -221,8 +294,10 @@ treat any single-run comparison as noise. The JSON is
    `saaras:v4`, manual endpointing, one warm socket per connection, 592 ms
    finalization (ADR 0003).
 2. ~~Default LLM~~ — done: Sarvam 105B, 206 ms TTFT p50.
-3. ~~TTS voice~~ — done: Cartesia `sonic-latest`, voice `2a12b36c…`, en-AU.
-4. **Media-gateway region** — `bom` provisional; the Fly matrix (§5) decides.
+3. ~~TTS voice~~ — done: Smallest Lightning `lightning_v3.1_pro`, voice `rhea`,
+   `language: "hi"` (ADR 0004). Cartesia remains the `iad-global` arm.
+4. **Media-gateway region** — `sin` deployed; `bom` unavailable on this account,
+   so the matrix in §5 stays partial.
 5. **Whether TURN relay is mandatory or host candidates suffice** — diagnostics
    `candidateType` from real sessions.
 6. **Real human-mic browser pass** — headless Chrome cannot grant microphone

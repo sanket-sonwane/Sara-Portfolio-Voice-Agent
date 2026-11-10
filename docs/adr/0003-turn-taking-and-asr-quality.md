@@ -120,6 +120,12 @@ silently fell back to the synthetic voice mid-answer. Synthesis runs ~11x faster
 than playback, so the bound costs no latency: the next segment is ready long
 before it is heard.
 
+**Amended 2026-11-10.** The bound was a workaround for Cartesia's two-context
+free tier, not a property worth keeping. `bom-india` now uses Smallest Lightning,
+which allows 10–15 concurrent streams, so `SMALLEST_MAX_CONCURRENCY` defaults to 4
+and every segment of an answer can be in flight at once (ADR 0004). The Cartesia
+adapter still honours `TTS_MAX_CONCURRENCY`.
+
 ## 8. Measured result
 
 Through the real gateway over `/ws/audio`, 2 turns on the fixture clip:

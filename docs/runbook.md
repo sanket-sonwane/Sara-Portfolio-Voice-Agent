@@ -1,16 +1,21 @@
 # Sara runbook
 
 Operational notes for the gateway. The product decisions behind these steps are
-in `docs/adr/0001-architecture-decisions.md` and `docs/adr/0002-india-first-providers.md`.
+in `docs/adr/0001-architecture-decisions.md`,
+`docs/adr/0002-india-first-providers.md` and
+`docs/adr/0004-tts-provider-selection.md`.
 
 ## 1. What runs where
 
 | Piece | Default | Notes |
 |---|---|---|
-| Gateway | Fly app `sarang-gateway`, region `bom` | FastAPI, WebRTC + WebSocket PCM |
+| Gateway | Fly app `sarang-gateway`, region `sin` | FastAPI, WebRTC + WebSocket PCM |
 | Client | static `apps/web/dist`, served by the gateway | also embeddable as `<SarangWidget />` |
-| TURN | coturn in `bom` | only needed when ICE cannot go direct |
+| TURN | coturn | only needed when ICE cannot go direct |
 | Tier-2 store | pgvector Postgres | optional; BM25 is the fallback |
+
+`bom` (Mumbai) is the intended region and is not available on this Fly account;
+`sin` is the nearest substitute (ADR 0002 §4).
 
 The gateway is deliberately one process. Do not split stages until concurrent
 sessions prove CPU interference (ADR 0001 §1).
@@ -22,7 +27,7 @@ fly launch --no-deploy --copy-config --name sarang-gateway
 fly secrets set \
   SESSION_SECRET="$(openssl rand -hex 32)" \
   SARVAM_API_KEY=... \
-  GEMINI_API_KEY=...
+  SMALLEST_API_KEY=...
 fly deploy
 fly logs
 ```
@@ -50,16 +55,27 @@ All credentials are backend-only. The browser receives a short-lived
 |---|---|
 | `SESSION_SECRET` | HMAC key for session tokens (required in production) |
 | `SARVAM_API_KEY` | ASR + LLM (default `bom-india` path) |
+| `SMALLEST_API_KEY` | TTS on the default `bom-india` path (ADR 0004) |
+| `SMALLEST_VOICE` | spoken voice; defaults to `rhea` (en-IN) |
+| `SMALLEST_LANGUAGE` | `hi` = Indian-accented English + Hindi code-switching; `en` = UK/US |
+| `SMALLEST_MODEL` | defaults to `lightning_v3.1_pro` |
+| `SMALLEST_MAX_CONCURRENCY` | in-flight segments; defaults to `4` |
+| `TTS_PROVIDER` | pins the arm (`smallest`, `cartesia`, `sarvam`, `synthetic`) |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini Flash-Lite; comparison arm only |
 | `GROQ_API_KEY` | comparison arm only; never required |
-| `CARTESIA_API_KEY` | TTS on the default `bom-india` path |
-| `CARTESIA_VOICE_ID` | spoken voice; defaults to `2a12b36c-7f9b-4c3a-9f7a-72731b15323a` (Sara) |
+| `CARTESIA_API_KEY` | TTS on the `iad-global` path and the comparison arm |
+| `CARTESIA_VOICE_ID` | Cartesia voice; defaults to `2a12b36c-7f9b-4c3a-9f7a-72731b15323a` |
 | `NVIDIA_API_KEY` | comparison ASR arm only |
 | `ALLOWED_ORIGINS` | comma-separated origin allowlist |
 | `DATABASE_URL` | enables pgvector/tsvector tier-2 retrieval |
 | `ICE_SERVERS` | `urls|user:secret;urls|user:secret` |
 | `ICE_FORCE_RELAY` | `true` forces TURN, useful when diagnosing ICE |
 | `SARANG_CACHE_DIR` | writable filler cache; defaults to `<repo>/cache` |
+
+`TTS_PROVIDER` is pinned in `fly.toml` `[env]`, not in a secret, so the deployed
+arm is reviewable in the repository. Filler clips are cached under a directory
+named after the provider, model, voice and language, so changing any of them
+re-renders instead of replaying the old voice.
 
 ## 4. TURN
 
@@ -121,6 +137,9 @@ If `eos_to_answer_audio_ms` regresses:
 |---|---|---|
 | Voice input never transcribes | ASR key missing or WS blocked | text still works; check `/healthz` `asr_ready` |
 | No audio at all | browser autoplay policy | press "Enable sound"; playback graph is created in the click handler |
+| Answer audio stops mid-sentence | TTS concurrency exhausted | Cartesia's free tier allows 2 contexts; `smallest` allows 10–15. Check `/healthz` `tts` |
+| Every turn is ~4 s slower than the audio | Smallest `complete_backoff_ms` left at its 4 s default | the adapter must send `0`; `bench/probe/smallest_ttfa.py` reports it as RTF 2.38 |
+| Fillers speak in the previous voice | filler cache reused across a provider change | clear `$SARANG_CACHE_DIR/fillers`; the tag should name the current provider |
 | `/api/offer` returns 503 | `aiortc` not installed | expected; browser uses `/ws/audio` |
 | Answers are generic/refusals | LLM unavailable, local answerer active | check `llm_ready`; local answers are grounded but extractive |
 | `retrieval` says `bm25-local (database unreachable)` | bad `DATABASE_URL` | fix the DSN or unset it; BM25 is fine |

@@ -20,8 +20,9 @@ The product spec lives in [`prd.md`](./prd.md). Architectural decisions are in
   hybrid lookup runs in-process, tier-2 BM25/pgvector sits behind tools. No
   portfolio digest in the prompt.
 - **Voice**: Sarvam `saaras:v4` streaming ASR and Sarvam 105B generation in the
-  India-first profile, with Cartesia Sonic TTS for the lowest measured
-  time-to-first-audio. Gemini, Groq and NVIDIA remain comparison arms.
+  India-first profile, with Smallest Lightning TTS (`rhea`, en-IN) for an Indian
+  accent and enough concurrency to speak every answer segment. Cartesia Sonic,
+  Gemini, Groq and NVIDIA remain comparison arms.
 - **Transport**: WebRTC when `aiortc` is installed; otherwise `/ws/audio` PCM16 at
   16 kHz up / 48 kHz down. Text-only sessions still open the audio transport for
   output.
@@ -57,7 +58,7 @@ static root is resolved at import time.
 
 | Profile | ASR | LLM | TTS | Use |
 |---|---|---|---|---|
-| `bom-india` (default) | Sarvam `saaras:v4` | Sarvam 105B | Cartesia Sonic | the product |
+| `bom-india` (default) | Sarvam `saaras:v4` | Sarvam 105B | Smallest Lightning | the product |
 | `iad-global` | NVIDIA | Groq | Cartesia | comparison only |
 | `local` | none | deterministic | synthetic | tests, zero keys |
 
