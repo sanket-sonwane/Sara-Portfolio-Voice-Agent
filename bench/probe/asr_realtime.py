@@ -68,13 +68,18 @@ async def run_realtime(
     first_partial: float | None = None
     final_text = ""
     final_ms: float | None = None
+    pump_done: float | None = None
 
     async def pump() -> None:
+        nonlocal pump_done
         await asr.begin_utterance()
         for offset in range(0, len(pcm), chunk_bytes):
             await asr.push(pcm[offset : offset + chunk_bytes])
             await asyncio.sleep(chunk_ms / 1000.0)
         await asr.finalize()
+        # When the last audio left us, so a final can be scored as
+        # "speech_end -> transcript.final" instead of clip-length noise.
+        pump_done = (time.perf_counter() - started) * 1000.0
 
     task = asyncio.create_task(pump())
     try:
@@ -97,6 +102,7 @@ async def run_realtime(
         "connect_ms": round(connected * 1000.0, 1),
         "first_partial_ms": round(first_partial, 1) if first_partial else None,
         "final_ms": round(final_ms, 1) if final_ms else None,
+        "pump_ms": round(pump_done, 1) if pump_done is not None else None,
         "partials": len(partials),
         "config": config,
         "error": asr.last_error,

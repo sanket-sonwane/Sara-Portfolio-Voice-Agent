@@ -279,6 +279,39 @@ slam next to a running fan), the transition window stays open for up to 300 ms,
 so ≥120 ms of loud ambient right after a transient can still commit
 `min_speech_ms`. The turn then endpointes within the silence window instead of
 hanging, and the transcript comes back empty or noise — bounded, not silent.
-This is detection, not recognition: the WER gate (FR-025) is still unscored,
-so nothing here claims anything about transcript accuracy.
+This is detection, not recognition: the WER gate (FR-025) is still unscored
+on real recordings, so nothing here claims anything about transcript accuracy.
+
+## 11. Stream type and chunk size are not accuracy levers
+
+**Decision.** Keep `stream_type=fast` and `chunk_ms=100` in production. Both
+were suspects — the stream type because it is a latency knob with no accuracy
+measurement behind it, the chunk size because only finalise latency had ever
+been measured for it.
+
+**Measured.** `bench/probe/asr_matrix.py` sweeps
+`{fast, balanced, simulated} x {20, 50, 100} ms` on the reference clip and
+scores WER against the known transcript. The API corrected the axis:
+`accurate` does not exist — the values are `fast`, `balanced`, `simulated`.
+
+| finding | evidence |
+|---|---|
+| WER is **0%** on all 9 cells | every stream type × chunk size transcribes the clip word-perfect |
+| chunk size changes nothing | first-partial and finalise vary more *between runs of the same cell* (656–1 443 ms) than between chunk sizes |
+| `simulated` emits **zero partials** | no live transcript at all; finalise 155–256 ms, i.e. faster than `fast`, but the drawer and partial UX need partials |
+| first partial lands 0.65–2.0 s into speech | provider-side: partials start once enough words accumulate; not a client lever |
+
+**Consequences.** The production config is validated, not merely assumed.
+"ASR is not performing well" is **not** raw transcription on clean audio —
+remaining suspects are the ones no fixture covers yet: real microphone noise,
+accents, and endpoint truncation (§1), and the answer layer `bench/eval.py`
+already grades. The sweep also produces the first WER numbers this project has
+ever had (FR-025 was open with no scorer); the caveat is fixture count: one
+10-word sentence moves WER in 10% steps, so here anything non-zero is a failure
+rather than a rate. Recorded reference clips (see `bench/audio/README.md`)
+are what turn this into a rate gate.
+
+**Not done:** `simulated` is not worth its missing partials for ~100–200 ms of
+finalise — it would trade every visitor's live transcript for a gain smaller
+than run-to-run variance.
 
