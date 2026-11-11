@@ -42,6 +42,7 @@ from .asr import build_asr
 from .asr.normalize import normalize_transcript
 from .audio.frames import frame_bytes, to_int16
 from .audio.vad import Vad, VadConfig
+from .kb.lookup import strip_discourse
 from .metrics import TurnMarks
 from .orchestrator import Orchestrator
 from .schemas import EventType, SessionState
@@ -171,6 +172,13 @@ class UtteranceLoop:
         if session.state == SessionState.SPEAKING:
             await self.orchestrator.interrupt(session, "barge-in")
 
+        # Speculation belongs to one utterance. An arm warmed for the
+        # previous question must never be adoptable for this one; the gates
+        # would likely refuse it anyway, but paying for it is pointless.
+        speculator = session.speculation
+        if speculator is not None:
+            speculator.reset()
+
         if self._finalizing and self._final_task is not None:
             # A previous turn is still waiting for its final. Give it a short
             # window; if it is stuck, abandon it rather than swallow new speech.
@@ -275,6 +283,14 @@ class UtteranceLoop:
                         EventType.TRANSCRIPT_PARTIAL,
                         {"text": utterance.latest, "source": "voice", "final": False},
                     )
+                    # Warm the lookup (and the speculative arm) from the
+                    # question itself, never from the discourse wrapped
+                    # around it - the same strip the turn engine applies.
+                    # Awaited inline: it is an in-memory lookup, and keeping
+                    # it in the reader preserves partial ordering.
+                    speculator = self.session.speculation
+                    if speculator is not None:
+                        await speculator.note(strip_discourse(utterance.latest))
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001

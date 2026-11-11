@@ -231,3 +231,46 @@ async def test_endpoint_window_is_recorded_in_media_time(engine, fake_asr, monke
         assert "endpoint" in marks.to_payload()["durations_ms"]
     finally:
         await loop.close()
+
+
+async def test_partial_transcript_warms_speculation_without_discourse(engine, fake_asr, no_turn):
+    """Partials feed the speculator with the question, not the filler around it."""
+    session = engine.create_session("test")
+    speculator = session.speculation
+    assert speculator is not None
+    noted: list[str] = []
+    original = speculator.note
+
+    async def capture(text: str):
+        noted.append(text)
+        return await original(text)
+
+    speculator.note = capture  # type: ignore[method-assign]
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+
+        for _ in range(2):
+            await fake_asr._events.put(
+                ASREvent(
+                    text="however i mean what projects did he build",
+                    final=False,
+                    utterance=0,
+                )
+            )
+        # Let the reader task consume both events and run note() inline.
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(noted) >= 2 and session.speculation.prepared >= 1:
+                break
+
+        assert noted[-1] == "what projects did he build"
+        assert len(noted) >= 2
+        assert session.speculation.prepared >= 1
+    finally:
+        await loop.close()

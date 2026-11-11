@@ -123,6 +123,11 @@ class Session:
     async def close(self) -> None:
         self.closed = True
         self.cancel_active_turn()
+        speculation = self.speculation
+        if speculation is not None:
+            # A closed session stops paying for speculative streams.
+            with contextlib.suppress(Exception):
+                speculation.reset()
         if self.asr is not None:
             with contextlib.suppress(Exception):
                 await self.asr.close()

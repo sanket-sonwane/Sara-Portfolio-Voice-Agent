@@ -186,7 +186,15 @@ class Settings:
     # Debug aid: write every utterance's exact 16 kHz PCM plus the transcript to
     # this directory. Empty disables it.
     asr_dump_dir: str = ""
+    # Legacy knob: still the filler wait (0 -> 0.6 s); no longer gates
+    # speculation, which is controlled by the two flags below.
     speculative_ms: int = 0
+    # Warm the lookup from stable partials while the visitor is still talking.
+    speculation_enabled: bool = True
+    # Additionally stream an LLM answer for the stable partial, buffered and
+    # only replayed when the evidence gates pass. Costs one extra provider
+    # stream per armed partial; bounded per session by Speculator.max_arms.
+    speculative_llm: bool = True
     max_answer_tokens: int = 160
     # Hard ceiling on what is actually spoken. The prompt asks for 35 words; this
     # is the enforcement, because a model that ignores the request would otherwise
@@ -349,6 +357,8 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         asr_final_timeout_s=number("ASR_FINAL_TIMEOUT_S", 3.5),
         asr_dump_dir=get("ASR_DUMP_DIR"),
         speculative_ms=integer("SPECULATIVE_MS", 0),
+        speculation_enabled=flag("SPECULATION_ENABLED", True),
+        speculative_llm=flag("SPECULATIVE_LLM", True),
         max_answer_tokens=integer("MAX_ANSWER_TOKENS", 160),
         max_spoken_words=integer("MAX_SPOKEN_WORDS", 50),
         filler_enabled=flag("FILLER_ENABLED", True),

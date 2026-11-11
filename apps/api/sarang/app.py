@@ -240,7 +240,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/metrics")
     async def metrics() -> dict[str, Any]:
-        spec: dict[str, int] = {"prepared": 0, "adopted": 0, "wasted": 0}
+        spec: dict[str, int] = {
+            "prepared": 0,
+            "adopted": 0,
+            "wasted": 0,
+            "armed": 0,
+            "arm_adopted": 0,
+            "arm_wasted": 0,
+        }
         for session in registry.sessions.values():
             candidate = getattr(session, "speculation", None)
             if candidate is None:

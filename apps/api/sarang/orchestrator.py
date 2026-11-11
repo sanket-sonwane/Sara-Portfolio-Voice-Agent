@@ -23,6 +23,7 @@ import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,7 @@ from .metrics import MetricsStore, TurnMarks, now
 from .schemas import EventType, SessionState
 from .segmenter import TextSegmenter, split_script
 from .session import Session, SessionRegistry
-from .speculative import Speculator
+from .speculative import Speculation, Speculator
 from .tools import ToolRunner
 from .tts import TTS, build_tts
 from .tts.filler import FillerBank
@@ -317,7 +318,12 @@ class Orchestrator:
             self.registry = SessionRegistry(self.settings, Bus())
         session = self.registry.create(client)
         session.speculation = Speculator(
-            enabled=bool(self.settings.speculative_ms) or self.settings.env == "dev"
+            enabled=self.settings.speculation_enabled,
+            # Binds this session's arm to this engine; ``speculative_llm``
+            # decides whether an arm exists at all.
+            armer=partial(self._spec_arm, session)
+            if self.settings.speculative_llm
+            else None,
         )
         session.egress.on_first_audio = lambda generation: self._on_first_audio(
             session, generation
@@ -395,6 +401,11 @@ class Orchestrator:
         if active is not None:
             active.cancelled = True
         session.cancel_active_turn()
+        speculation = session.speculation
+        if speculation is not None:
+            # A barge-in rewrites the conversation: an arm warmed for the
+            # interrupted turn must never be adopted by the next one.
+            speculation.reset()
         for speech in list(self._active_speech):
             await speech.cancel()
         session.publish(
@@ -575,13 +586,56 @@ class Orchestrator:
         )
         runtime.marks.exit("context")
 
+        # ------------------------------------------------------- speculative arm
+        # Replay the stream that started while the visitor was still talking,
+        # but only if it was answering exactly this turn's question. The
+        # evidence gate already ran in consume(); here the rest of the prompt
+        # must be identical - system prompt with its context and the whole
+        # conversation. Only the question text may differ, bounded by the
+        # token and evidence gates, because the final transcript can add words
+        # the partial had not heard yet.
+        arm: Speculation | None = None
+        if speculation is not None and speculator is not None:
+            if (
+                speculation.arm_queue is not None
+                and speculation.arm_error is None
+                and speculation.arm_messages is not None
+                and not result.needs_depth
+                and messages[:-1] == speculation.arm_messages[:-1]
+            ):
+                arm = speculation
+            else:
+                speculator.discard(speculation)
+
         # ---------------------------------------------------------------- LLM
         runtime.llm_started = now()
         runtime.marks.enter("llm_ttft")
         runtime.marks.enter("llm_total")
         tool_used = False
         try:
-            answer, tool_calls = await self._stream_once(runtime, messages, allow_tools=True)
+            if arm is not None:
+                try:
+                    answer, tool_calls = await self._replay(runtime, arm)
+                    assert speculator is not None
+                    speculator.mark_adopted(arm)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    if runtime.first_token or runtime.segments:
+                        # Mid-answer: degrade exactly like a live stream
+                        # failure, through the outer handler below.
+                        raise
+                    # Nothing was spoken yet: the arm failed early, so pay
+                    # for a fresh stream rather than the local answerer.
+                    log.warning("speculative arm failed early: %s", error)
+                    speculator.discard(arm)
+                    answer, tool_calls = await self._stream_once(
+                        runtime, messages, allow_tools=True
+                    )
+            else:
+                answer, tool_calls = await self._stream_once(
+                    runtime, messages, allow_tools=True
+                )
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001
@@ -649,6 +703,67 @@ class Orchestrator:
 
     # ------------------------------------------------------------- streaming
 
+    async def _spec_arm(self, session: Session, spec: Speculation) -> bool:
+        """Stream an answer for a stable partial while the visitor talks.
+
+        The result is never spoken early: it fills ``spec.arm_queue`` and is
+        replayed through the normal consume path only when the turn's gates
+        pass. Returns whether a stream was actually started - declining (no
+        provider, unconfident or out-of-scope evidence) costs nothing.
+
+        The messages are built exactly as ``_run_turn`` builds them, except
+        that the question is the stable partial, since the final transcript
+        does not exist yet. Adoption later requires every other message to be
+        byte-identical, so a divergence here simply means no adoption.
+        """
+        if self.llm is None or not self.settings.speculative_llm or session.closed:
+            return False
+        result = spec.result
+        if (
+            not result.confident
+            or result.needs_depth
+            or result.blocked
+            or not result.blocks
+            or result.reason in {"off topic", "task request"}
+        ):
+            return False
+        if result.reason == "generic project overview":
+            context = render_overview(result.blocks)
+        else:
+            context = render_context(result.blocks)
+        # The turn appends the current question with history[:-1]; at arm time
+        # the question is not in history yet, so the whole history goes in.
+        messages = build_messages(
+            spec.text,
+            context,
+            history=list(session.history),
+            lexicon=None,
+        )
+        spec.arm_messages = messages
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        spec.arm_queue = queue
+        stream = self.llm.stream(
+            messages,
+            tools=None,
+            max_tokens=self.settings.max_answer_tokens,
+            temperature=0.25,
+        )
+
+        async def pump() -> None:
+            try:
+                async for event in stream:
+                    await queue.put(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                spec.arm_error = error
+                queue.put_nowait(_StreamError(error))
+            finally:
+                queue.put_nowait(_END)
+
+        spec.arm_task = asyncio.create_task(pump())
+        return True
+
     async def _stream_once(
         self,
         runtime: TurnRuntime,
@@ -684,10 +799,37 @@ class Orchestrator:
         *,
         allow_tools: bool,
     ) -> tuple[str, list[ToolCall]]:
-        session = runtime.session
-        generation = runtime.generation
         queue: asyncio.Queue[Any] = asyncio.Queue()
         pump = asyncio.create_task(self._pump(stream, queue))
+        return await self._drain(runtime, queue, pump, allow_tools=allow_tools)
+
+    async def _replay(
+        self,
+        runtime: TurnRuntime,
+        speculation: Speculation,
+    ) -> tuple[str, list[ToolCall]]:
+        """Drain an arm that streamed while the visitor was still talking.
+
+        No provider request is made here - that is where the saved latency
+        comes from. The queue may still be filling; ``_drain`` reads it at
+        the same pace either way.
+        """
+        queue = speculation.arm_queue
+        if queue is None:
+            raise LLMError("speculative arm has no queue")
+        pump = speculation.arm_task
+        return await self._drain(runtime, queue, pump, allow_tools=False)
+
+    async def _drain(
+        self,
+        runtime: TurnRuntime,
+        queue: asyncio.Queue[Any],
+        pump: asyncio.Task[Any] | None,
+        *,
+        allow_tools: bool,
+    ) -> tuple[str, list[ToolCall]]:
+        session = runtime.session
+        generation = runtime.generation
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         filler_used = runtime.filler_used
@@ -743,7 +885,7 @@ class Orchestrator:
                 # Done carries usage; the metrics we publish are wall-clock and
                 # do not depend on provider token accounting.
         finally:
-            if not pump.done():
+            if pump is not None and not pump.done():
                 pump.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await pump
