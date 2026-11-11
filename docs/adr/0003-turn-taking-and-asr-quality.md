@@ -218,9 +218,10 @@ consequence of waiting for a real final instead of accepting a partial.
 
 ## 9. Not done, deliberately
 
-* **Silero VAD.** The energy VAD is adequate once endpointing is generous. A
-  learned VAD would let the silence window drop back towards 500 ms without
-  clipping, and is the next quality step.
+* **Silero VAD.** The energy VAD is adequate once endpointing is generous, and
+  its detector is now measured rather than assumed (§10). A learned VAD would
+  let the silence window drop back towards 500 ms without clipping, and is the
+  next quality step.
 * **REST hybrid finalizer.** Measured and rejected: 1 335 ms for a 4.16 s clip,
   and no keyterm biasing, so it transcribed `ARAI` as `ARII` where the realtime
   socket got it right. It runs on a separate concurrency pool, so the realtime
@@ -229,4 +230,55 @@ consequence of waiting for a real final instead of accepting a partial.
   ICE fails, so `ENABLE_WEBRTC=false` in `fly.toml` until a TURN server exists.
   WebRTC's Opus and jitter buffer are worth having, but not at the cost of every
   visitor paying a failed ICE before the WebSocket fallback connects.
+
+## 10. What counts as speech at all
+
+**Decision.** The energy detector's absolute floor is **−55 dBFS** (was −42),
+and a frame is speech only if it is *both* above the threshold **and** not
+steady: level spread over a rolling **300 ms** window must be at least
+**1.5 dB**. The zero-crossing hum guard stays as it was.
+
+**Why the floor moved (measured).** `bench/probe/vad_accuracy.py` measures the
+reference clip against ground truth it cannot see. Real speech sits at RMS
+p05/p50/p95 = −47/−27/−20 dBFS — **11% of speech frames were below the old
+−42 floor**, and a speaker scaled to −50 dBFS was not detected at all. The
+floor only binds in a *quiet* room (`noise_floor + 9 dB` is higher in a noisy
+one), so lowering it costs nothing where it used to work and buys hearing a
+quiet speaker.
+
+**Why the steadiness gate is required (the worst failure found so far).**
+Steady ambient sound at or above the floor — a fan at −35 dBFS, mains hum —
+passed the level test after ~120 ms, because `min_speech_ms` commits before the
+adaptive noise floor (780 ms to climb) ever learns the room. Once active, every
+following frame was also "speech", so **the turn never endpointed**: the
+utterance loop captured forever. The gate kills the whole class because speech
+is amplitude-modulated by syllables and steady sound is not:
+
+| signal | level spread over 300 ms | zero-crossing rate |
+|---|---|---|
+| speech | p05 **3.1 dB** | 0.000 – 0.389 |
+| 50 Hz hum −35 | **0.0 dB** | 0.003 |
+| white noise −35 | **0.2 – 0.4 dB** | 0.455 |
+
+The separation is wide (10× either side of the 1.5 dB gate), and a zero-crossing
+test can never catch the noise case at all — noise crosses zeros like speech
+does. The gate also makes the lower floor safe: room hiss at −50 dBFS is
+level-speech and steady-not-speech.
+
+**Evidence of effect.** After both changes the probe reports **0 problem
+scenarios** out of 27, where the shipped configuration had 5: quiet speech
+(−50 dBFS) is detected (start delay 160 ms), all ten steady hum/noise-only
+streams are rejected, speech endpoints *through* continuous −45/−40 dBFS
+room noise instead of hanging, endpoint placement is unchanged (745–785 ms =
+the configured window), and speech starting at frame 0 opens in 140 ms. The
+gate only ever delays a *transition*, never steady sound: at a normal onset the
+silence-to-speech jump spikes the window wide open.
+
+**Trade-off.** After an abrupt level jump in a steady environment (a door
+slam next to a running fan), the transition window stays open for up to 300 ms,
+so ≥120 ms of loud ambient right after a transient can still commit
+`min_speech_ms`. The turn then endpointes within the silence window instead of
+hanging, and the transcript comes back empty or noise — bounded, not silent.
+This is detection, not recognition: the WER gate (FR-025) is still unscored,
+so nothing here claims anything about transcript accuracy.
 

@@ -71,5 +71,23 @@ def tone(ms: int = 20, rate: int = 16_000, amplitude: int = 9_000) -> np.ndarray
     return signal.astype(np.int16)
 
 
+def vocal(ms: int = 20, rate: int = 16_000, amplitude: int = 12_000,
+          offset_ms: float = 0.0) -> np.ndarray:
+    """A speech stand-in: a tone with a syllabic tremolo.
+
+    The VAD rejects steady sound by its lack of level modulation over a 300 ms
+    window, so test "speech" has to modulate the way speech does - a plain
+    ``tone()`` is exactly what the detector must ignore. ``offset_ms`` keeps the
+    modulation continuous across consecutive frames; pass ``i * 20`` when
+    pushing frame ``i``.
+    """
+    count = rate * ms // 1000
+    start = int(rate * offset_ms // 1000)
+    t = np.arange(start, start + count, dtype=np.float32) / rate
+    envelope = 0.7 + 0.3 * np.sin(2 * np.pi * 12.0 * t)
+    signal = np.sin(2 * np.pi * 220.0 * t) * amplitude * envelope
+    return signal.astype(np.int16)
+
+
 def silence(ms: int = 20, rate: int = 16_000) -> np.ndarray:
     return np.zeros(rate * ms // 1000, dtype=np.int16)

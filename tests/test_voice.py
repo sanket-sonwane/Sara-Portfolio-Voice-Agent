@@ -17,7 +17,7 @@ from sarang.orchestrator import Orchestrator
 from sarang.session import SessionRegistry
 from sarang.voice import UtteranceLoop
 
-from tests.conftest import silence, tone
+from tests.conftest import silence, vocal
 
 
 class FakeASR(ASRSession):
@@ -107,7 +107,10 @@ async def test_preroll_keeps_the_first_syllable(engine, fake_asr, no_turn):
     try:
         await loop.warm()
 
-        frames = [tone(20) for _ in range(8)]
+        # A real transport pushes room tone before the visitor speaks; the
+        # pre-roll must start from the very first frame of the connection.
+        frames = [silence(20) for _ in range(6)]
+        frames += [vocal(20, offset_ms=i * 20.0) for i in range(8)]
         for frame in frames:
             await loop.push(frame)
 
@@ -128,14 +131,16 @@ async def test_mid_sentence_pause_does_not_split_the_turn(engine, fake_asr, no_t
     try:
         await loop.warm()
 
-        for _ in range(10):
-            await loop.push(tone(20))
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
         # 400 ms of thinking time: below the 800 ms endpoint window, above the
         # 250 ms hangover. This used to end the turn and start an answer.
         for _ in range(20):
             await loop.push(silence(20))
-        for _ in range(10):
-            await loop.push(tone(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=(200.0 + i * 20.0)))
 
         await asyncio.sleep(0)
         assert fake_asr.begins == 1
@@ -164,8 +169,10 @@ async def test_partial_is_only_used_when_the_final_never_arrives(
     try:
         await loop.warm()
 
-        for _ in range(10):
-            await loop.push(tone(20))
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
         await asr._events.put(
             ASREvent(text="what did you build", final=False, utterance=0)
         )
