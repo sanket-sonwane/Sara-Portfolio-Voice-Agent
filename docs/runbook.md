@@ -121,8 +121,35 @@ process after rebuilding.
 - `/healthz` — profile, provider readiness, KB block count, uptime.
 - `/api/config` — public, credential-free configuration.
 - `/api/metrics` — rolling stage distributions, tool calls, speculation adoption.
-- Diagnostics drawer — last turn's `eos_to_answer_audio_ms` (the honest number),
+- Diagnostics drawer - last turn's `eos_to_answer_audio_ms` (the honest number),
   `eos_to_first_audio_ms` (may include a filler), transport, ICE candidate type.
+
+### Measuring the visitor's own number
+
+`eos_to_answer_audio_ms` is measured on the server, so it cannot contain the
+return network path or the browser's playback start. The diagnostics drawer
+reports both sides, and the difference between them is that leg:
+
+- **in this browser, speech end → audible** — the client's own stamps: when it
+  saw the server leave `user_speaking`, and when its `AudioContext` scheduled the
+  first answer buffer to be *heard*. Both are on `performance.now()`, so no clock
+  sync is involved and a stalled tab cannot shift the answer.
+- **network + playback** — the difference from `eos_to_answer_audio_ms`.
+
+A headless browser cannot be granted a microphone, so this needs a real one:
+
+1. Open `https://sarang-gateway.fly.dev/` in Chrome, allow the microphone, and
+   press "Enable sound" (the playback graph is created in the click handler, so
+   without the gesture the browser's autoplay policy blocks it).
+2. Ask three or four questions, leaving a natural pause at the end of each, and
+   read the diagnostics drawer after every turn.
+3. Compare the two figures. A server number that is high with a small gap means
+   the provider was slow on that turn; a small server number with a large gap
+   means the network leg or playback start is the problem, and no amount of
+   pipeline work will move it.
+
+Expect the gap to sit near the round trip to `sin` plus 25 ms of playback lead.
+
 
 If `eos_to_answer_audio_ms` regresses:
 
@@ -144,6 +171,7 @@ If `eos_to_answer_audio_ms` regresses:
 | Answers are generic/refusals | LLM unavailable, local answerer active | check `llm_ready`; local answers are grounded but extractive |
 | `retrieval` says `bm25-local (database unreachable)` | bad `DATABASE_URL` | fix the DSN or unset it; BM25 is fine |
 | High `wasted` speculation | prefetch misses | lower `SPECULATIVE_MS` or disable it |
+| `fly deploy` fails with "insufficient CPUs available … on the current host" | the `sin` host has no room for an in-place machine update | `fly deploy --strategy immediate` replaces the machine instead of updating it; the volume and secrets are untouched |
 
 ## 8. Rollback
 
