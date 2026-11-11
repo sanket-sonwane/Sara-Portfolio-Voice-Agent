@@ -247,7 +247,26 @@ Server-side components, against the plan's estimates:
 | Egress reframe | 20–30 | 10 | ok |
 | **Server subtotal (excl. endpointing)** | **340–385** | **~1 160** | +775 |
 | Browser network (one-way) | 120–200 | not measured (loopback) | — |
-| Playback start | 20–30 | not measured (loopback) | — |
+| Playback start | 20–30 | 25 (scheduled lead) | ok |
+
+The browser leg now has a measurement rather than a subtraction. The client
+timestamps the moment its own `AudioContext` schedules the first answer buffer to
+be audible, and the moment it saw the server leave `user_speaking`; both are on
+`performance.now()`, so the difference needs no clock sync and contains exactly
+the return network path plus playback start. The diagnostics panel reports it as
+"in this browser, speech end → audible" next to the server's own figure, and the
+difference between the two is the leg the server cannot see. Before this, the
+only way to estimate that leg was to subtract a server number from a Python
+probe's client total, which is how a 10.7 s client outlier appeared next to a
+1.3 s server turn with no way to attribute it.
+
+Playback start is 25 ms because the browser used to apply a **50 ms** scheduling
+lead to the first chunk of every turn. The comment claimed it absorbed jitter
+"once playback is under way", but the branch only runs when nothing is queued, so
+it was never a steady-state cushion — it was 50 ms in front of the first word,
+on every turn, after the server had just stopped pacing its own first frame. The
+lead is now 25 ms, which still clears the audio thread's render quantum; if a
+real-mic pass shows a dropout at a chunk boundary the constant goes back up.
 | **End-to-end** | **480–615** | **1 961** | +1 350 |
 
 The two totals are 10 ms apart, so no filler was needed on this question. Report
