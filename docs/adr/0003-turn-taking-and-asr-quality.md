@@ -81,6 +81,19 @@ the window expires. `bench/probe/asr_speculation.py` measured two things:
    doubles them — parallel feed or burst replay — is unavailable, and would also
    multiply with session count in production.
 
+The REST endpoint is a different pool, so it is not blocked by that concurrency
+limit — `bench/probe/asr_realtime.py` completes a `/speech-to-text` call while the
+realtime socket is still being refused. It is still unusable, for two
+independent reasons measured in the same run:
+
+* **Latency.** 1 335 ms for a 4.16 s clip, against the ~300 ms left in the
+  window after closing at 500 ms of silence. The window would have to grow, which
+  defeats the purpose.
+* **Accuracy.** The REST path has no keyterm or prompt biasing, so the same
+  audio transcribed as `"…during the ARII internship?"` where the realtime
+  socket, given the keyterms, produced `"ARAI"`. Trading a wrong proper noun for
+  latency is exactly what this ADR exists to prevent.
+
 The one single-socket lever was also measured and is not one.
 `bench/probe/asr_final_tail.py` compares the adapter's chunking: 20 ms chunks
 give 297 ms p50 from `speech_end` to final against 221 ms at 50 ms, because the
@@ -89,8 +102,8 @@ provider has to process. Production already runs 100 ms at ~175 ms p50, so the
 differences are provider noise and the tail is not ours to shorten.
 
 Endpointing and ASR finalization are therefore both closed: 800 ms because the
-measured pause floor demands it, and `asr_final` because the only ways to overlap
-it are refused by the plan or slower than waiting.
+measured pause floor demands it, and `asr_final` because every way to overlap it
+is refused by the plan, slower than waiting, or less accurate.
 
 
 ## 2. One recogniser socket per connection, not one per utterance
@@ -208,9 +221,10 @@ consequence of waiting for a real final instead of accepting a partial.
 * **Silero VAD.** The energy VAD is adequate once endpointing is generous. A
   learned VAD would let the silence window drop back towards 500 ms without
   clipping, and is the next quality step.
-* **REST hybrid finalizer.** Re-running the utterance through `/speech-to-text`
-  after `speech_end` would likely beat the streaming final on accuracy at the
-  cost of ~700 ms. Worth measuring before adopting.
+* **REST hybrid finalizer.** Measured and rejected: 1 335 ms for a 4.16 s clip,
+  and no keyterm biasing, so it transcribed `ARAI` as `ARII` where the realtime
+  socket got it right. It runs on a separate concurrency pool, so the realtime
+  limit is not what rules it out — the latency and the accuracy are. See §1.
 * **TURN for WebRTC.** With STUN only, Fly gives private `fdaa:` candidates and
   ICE fails, so `ENABLE_WEBRTC=false` in `fly.toml` until a TURN server exists.
   WebRTC's Opus and jitter buffer are worth having, but not at the cost of every
