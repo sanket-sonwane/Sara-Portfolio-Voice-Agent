@@ -22,7 +22,11 @@ def test_token_is_bound_to_its_session():
 
 def test_tampered_signature_is_rejected():
     token = auth.issue_token("ses_abc", SECRET, ttl_s=600)
-    assert not auth.verify_token(token[:-2] + "00", SECRET)
+    # Pick a tail guaranteed to differ: a fixed "00" collided whenever the
+    # signature already ended in 00 (1 run in 256), and the test then passed
+    # on a perfectly valid token.
+    tail = "00" if not token.endswith("00") else "11"
+    assert not auth.verify_token(token[:-2] + tail, SECRET)
     assert not auth.verify_token(token, "wrong-secret")
 
 
