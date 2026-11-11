@@ -157,6 +157,23 @@ A headless browser cannot be granted a microphone, so this needs a real one:
 
 Expect the gap to sit near the round trip to `sin` plus 25 ms of playback lead.
 
+The drawer now keeps the last eight answered turns, so the pass produces a
+distribution rather than one number. Typed turns appear in the list but are
+excluded from the median, because a typed question skips endpointing and ASR
+entirely and would drag the figure down.
+
+Before spending a session on the manual pass, check the drawer still works:
+
+```bash
+cd apps/web
+npm run smoke -- --url https://sarang-gateway.fly.dev/ \
+  --question "What did Sanket build during the ARAI internship?"
+```
+
+It drives the built page in headless Chrome, asks a typed question, opens the
+drawer, and exits non-zero on any console error. It cannot test the microphone —
+that is what the manual pass is for — but it catches a broken panel first.
+
 
 If `eos_to_answer_audio_ms` regresses:
 
