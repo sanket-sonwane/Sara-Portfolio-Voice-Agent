@@ -35,32 +35,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import re
 import statistics
 import time
 from pathlib import Path
 
 from sarang.asr.keyterms import build_keyterms, domain_prompt
 
-from bench.probe.asr_realtime import _edit_distance, read_pcm, run_realtime
+from bench.probe.asr_realtime import read_pcm, run_realtime
 from bench.probe.common import (
     AUDIO_DIR,
     format_table,
     load_env,
     optional_env,
     require_env,
+    word_error_rate,
 )
 
 DEFAULT_REFERENCE = "What did Sanket build during the ARAI internship?"
-
-
-def words(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9']+", text.lower())
-
-
-def word_error_rate(reference: str, hypothesis: str) -> float:
-    ref = words(reference)
-    return _edit_distance(ref, words(hypothesis)) / max(1, len(ref))
 
 
 def median(values: list[float]) -> str:

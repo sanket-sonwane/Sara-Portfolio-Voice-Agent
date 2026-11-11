@@ -17,6 +17,7 @@ import json
 import math
 import os
 import platform
+import re
 import socket
 import statistics
 import time
@@ -136,6 +137,30 @@ def format_table(rows: Iterable[dict[str, Any]], columns: Sequence[str]) -> str:
         for row in rows
     ]
     return "\n".join([header, divider, *body])
+
+
+# ------------------------------------------------------------------------ text
+
+
+def words(text: str) -> list[str]:
+    """Lowercased alphanumeric tokens; punctuation never scores as a word."""
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def edit_distance(reference: list[str], hypothesis: list[str]) -> int:
+    previous = list(range(len(hypothesis) + 1))
+    for i, ref in enumerate(reference, start=1):
+        current = [i]
+        for j, hyp in enumerate(hypothesis, start=1):
+            cost = 0 if ref == hyp else 1
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost))
+        previous = current
+    return previous[-1]
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    ref = words(reference)
+    return edit_distance(ref, words(hypothesis)) / max(1, len(ref))
 
 
 # ----------------------------------------------------------------------- result

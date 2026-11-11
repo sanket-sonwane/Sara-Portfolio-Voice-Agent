@@ -24,7 +24,14 @@ import httpx
 from sarang.asr.keyterms import build_keyterms, domain_prompt
 from sarang.asr.sarvam import SarvamASR
 
-from bench.probe.common import AUDIO_DIR, format_table, load_env, optional_env, require_env
+from bench.probe.common import (
+    AUDIO_DIR,
+    edit_distance,
+    format_table,
+    load_env,
+    optional_env,
+    require_env,
+)
 
 
 def read_pcm(path: Path) -> bytes:
@@ -210,7 +217,7 @@ def main() -> int:
         reference = args.reference.split()
         for row in rows:
             hypothesis = row["text"].split()
-            distance = _edit_distance(reference, hypothesis)
+            distance = edit_distance(reference, hypothesis)
             print(f"{row['arm']}: WER {distance / max(1, len(reference)):.1%}")
 
     for row in rows:
@@ -219,17 +226,6 @@ def main() -> int:
         if row.get("error"):
             print(f"\n{row['arm']} error: {row['error']}")
     return 0
-
-
-def _edit_distance(reference: list[str], hypothesis: list[str]) -> int:
-    previous = list(range(len(hypothesis) + 1))
-    for i, ref in enumerate(reference, start=1):
-        current = [i]
-        for j, hyp in enumerate(hypothesis, start=1):
-            cost = 0 if ref.lower() == hyp.lower() else 1
-            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost))
-        previous = current
-    return previous[-1]
 
 
 if __name__ == "__main__":

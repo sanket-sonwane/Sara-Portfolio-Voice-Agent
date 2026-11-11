@@ -166,13 +166,59 @@ Before spending a session on the manual pass, check the drawer still works:
 
 ```bash
 cd apps/web
-npm run smoke -- --url https://sarang-gateway.fly.dev/ \
+node scripts/smoke.mjs --url https://sarang-gateway.fly.dev/ \
   --question "What did Sanket build during the ARAI internship?"
 ```
+
+(Not `npm run smoke --`: npm parses `--url`/`--question` as npm config and
+drops them, so the script silently falls back to `127.0.0.1:8080`.)
 
 It drives the built page in headless Chrome, asks a typed question, opens the
 drawer, and exits non-zero on any console error. It cannot test the microphone —
 that is what the manual pass is for — but it catches a broken panel first.
+
+### Capturing reference recordings (the WER corpus)
+
+FR-025 wants WER < 6% as a *rate*, and one fixture cannot produce a rate. The
+ASR dump turns a normal voice session into fixtures: every spoken turn is
+written as `utt-NNN-HHMMSS.wav` plus a JSON sidecar (what the recogniser
+heard, its config, `asr_final_ms`). WER needs what the visitor really said, so
+this pass reads a fixed script — the script *is* the reference.
+
+Record locally so the files land in the repo instead of a container (the local
+profile still speaks real Sarvam ASR: `.env` pins `SARANG_PROFILE=bom-india`):
+
+```bash
+ASR_DUMP_DIR=bench/audio/recorded PYTHONPATH=apps/api \
+  .venv/Scripts/python.exe -m sarang          # port 8000, loads .env
+cd apps/web && npm run dev                    # 5173, proxies /ws to :8000
+```
+
+Open `http://localhost:5173`, allow the microphone, enable sound, and read
+these six sentences **once each, in order, at natural pace** (if a retake is
+unavoidable, note which number — alignment is by dump timestamp):
+
+1. What did Sanket build during the ARAI internship?
+2. Tell me how the voice pipeline decides when a turn is over.
+3. Why does retrieval sometimes give a long answer?
+4. Sanket and Prisha reviewed OSMR in Pune last March.
+5. Does the scheduler accept SCHED_EXT workloads here?
+6. How many milliseconds does endpointing add to every answer?
+
+Then score:
+
+```bash
+.venv/Scripts/python.exe -m bench.probe.dump_wer --dump bench/audio/recorded --template
+# fill the generated refs.yaml (the script lines; "heard" is a comment to check against)
+.venv/Scripts/python.exe -m bench.probe.dump_wer --dump bench/audio/recorded \
+  --refs bench/audio/recorded/refs.yaml --max-wer 0.06
+```
+
+The scorer reports per-file and corpus WER, exits non-zero past `--max-wer`,
+and lists dumps with no reference (own questions from the latency pass score
+nothing until their text is pasted in). The recordings double as real-mic
+input for `bench/probe/vad_accuracy.py`, which until now only ever saw
+synthetic speech.
 
 
 If `eos_to_answer_audio_ms` regresses:
