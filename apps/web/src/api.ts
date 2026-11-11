@@ -96,6 +96,13 @@ export interface TurnMetrics {
   eos_to_first_audio_ms?: number;
   answer_first_audio_ms?: number;
   eos_to_answer_audio_ms?: number;
+  /**
+   * Measured in the browser, not the server: this client's observed end of
+   * speech → the moment the first answer audio is scheduled to be audible.
+   * The difference from `eos_to_answer_audio_ms` is the return network path
+   * plus playback start, which no server-side number can contain.
+   */
+  client_eos_to_audible_ms?: number;
 }
 
 export interface StageStat {

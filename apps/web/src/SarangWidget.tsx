@@ -281,6 +281,23 @@ function Diagnostics({ sarang }: { sarang: UseSarang }) {
               End of speech → answer audio: <strong>{formatMs(lastTurn.eos_to_answer_audio_ms)}</strong>
               {" · "}first audible (incl. filler): <strong>{formatMs(lastTurn.eos_to_first_audio_ms)}</strong>
             </p>
+            {lastTurn.client_eos_to_audible_ms !== undefined && (
+              <p className="sarang-diag-lead">
+                In this browser, speech end → audible:{" "}
+                <strong>{formatMs(lastTurn.client_eos_to_audible_ms)}</strong>
+                {lastTurn.eos_to_answer_audio_ms !== undefined && (
+                  <>
+                    {" · "}network + playback:{" "}
+                    <strong>
+                      {formatMs(
+                        lastTurn.client_eos_to_audible_ms -
+                          lastTurn.eos_to_answer_audio_ms,
+                      )}
+                    </strong>
+                  </>
+                )}
+              </p>
+            )}
             <dl>
               {Object.entries(lastTurn.durations_ms ?? {}).map(([stage, value]) => (
                 <div key={stage} className="sarang-diag-row">

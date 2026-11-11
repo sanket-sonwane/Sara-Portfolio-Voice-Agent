@@ -238,6 +238,14 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
   const reconnectAttemptsRef = useRef(0);
   const lastBargeRef = useRef(0);
   const speechCandidateRef = useRef(0);
+  // Visitor-experienced latency, both stamps on the performance.now() clock so
+  // no server/client clock sync is needed. `eosAt` is when this client saw the
+  // server leave `user_speaking`; `audibleAt` is when the first answer chunk of
+  // that turn is scheduled to be heard. Their difference is the leg the server
+  // cannot measure: the return network path plus playback start.
+  const eosAtRef = useRef<number | null>(null);
+  const turnAudibleAtRef = useRef<number | null>(null);
+  const prevServerStateRef = useRef<api.ServerState>("idle");
   const noiseFloorRef = useRef(0.01);
   const openEventsRef = useRef<(session: api.SessionResponse, lifespan: number) => void>(() => undefined);
   const startAudioRef = useRef<(session: api.SessionResponse, lifespan: number) => Promise<void>>(
@@ -362,6 +370,17 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
   const applyServerState = useCallback(
     (state: api.ServerState, stateDetail: string, mutedFlag?: boolean) => {
       setServerState(state);
+      if (state === "user_speaking") {
+        // A new utterance: the next run of playback is this turn's answer, and
+        // the previous turn's stamps must not be reused.
+        turnAudibleAtRef.current = null;
+        eosAtRef.current = null;
+      } else if (prevServerStateRef.current === "user_speaking") {
+        // The server decided the turn ended. Everything after this point is the
+        // leg the visitor actually waits through, measured from here.
+        eosAtRef.current = performance.now();
+      }
+      prevServerStateRef.current = state;
       if (typeof mutedFlag === "boolean" && mutedFlag !== mutedRef.current) {
         setMuted(mutedFlag);
       }
@@ -647,7 +666,19 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           break;
         }
         case "metrics.turn": {
-          setLastTurn(event.payload as unknown as api.TurnMetrics);
+          const turn = event.payload as unknown as api.TurnMetrics;
+          const eos = eosAtRef.current;
+          const audible = turnAudibleAtRef.current;
+          setLastTurn({
+            ...turn,
+            // Only meaningful when both stamps belong to the same turn and the
+            // answer came after the end of speech. Anything else is a text turn,
+            // a barge-in, or a greeting, and must not invent a number.
+            client_eos_to_audible_ms:
+              eos !== null && audible !== null && audible >= eos
+                ? Math.round(audible - eos)
+                : undefined,
+          });
           break;
         }
         case "epoch": {
@@ -834,7 +865,18 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           sr: micRef.current?.sampleRate ?? 48_000,
         }),
         {
-          onAudio: (pcm) => playbackRef.current?.enqueue(pcm),
+          onAudio: (pcm) => {
+            const playback = playbackRef.current;
+            if (!playback) return;
+            playback.enqueue(pcm);
+            // Snapshot the first run of playback for this turn. Reading it later
+            // would be wrong: a dry spell mid-answer starts a new run and would
+            // overwrite the only stamp that answers "when did the visitor hear
+            // the first word".
+            if (turnAudibleAtRef.current === null && playback.audibleFrom !== null) {
+              turnAudibleAtRef.current = playback.audibleFrom;
+            }
+          },
           onOpen: () => {
             if (lifespan !== lifespanRef.current || endedRef.current) return;
             transportReadyRef.current = true;

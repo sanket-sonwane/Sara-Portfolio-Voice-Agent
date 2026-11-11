@@ -218,6 +218,11 @@ export class Playback {
   private readonly resampler: LinearResampler;
   private playhead = 0;
   private closed = false;
+  // When the audio scheduled in the current run first becomes audible, on the
+  // performance.now() clock. Null until something is scheduled, and cleared when
+  // the run is flushed. This is the only honest answer to "when did the visitor
+  // hear it": a buffer that has been enqueued has not been heard yet.
+  private audibleAt: number | null = null;
 
   constructor() {
     const AudioContextClass = audioContextConstructor();
@@ -247,6 +252,11 @@ export class Playback {
     return !this.closed && this.context.state === "running";
   }
 
+  /** `performance.now()` at which the current run of audio becomes audible. */
+  get audibleFrom(): number | null {
+    return this.audibleAt;
+  }
+
   enqueue(pcm: Int16Array): void {
     if (this.closed || !pcm.length) return;
     let samples = int16ToFloat(pcm);
@@ -264,9 +274,14 @@ export class Playback {
 
     const now = this.context.currentTime;
     if (this.playhead < now + 0.01) {
-      // A small fixed lead absorbs scheduling jitter without adding perceptible
-      // latency once playback is under way.
-      this.playhead = now + 0.05;
+      // This branch only runs when nothing is queued: the first chunk of a turn,
+      // or the first chunk after playback ran dry. It is therefore *not* a
+      // jitter absorber for steady playback, and it is paid in full by the
+      // visitor on every turn. 25 ms still clears the audio thread's own render
+      // quantum with margin, and scheduling later than `now` is what stops the
+      // first buffer from being clipped.
+      this.playhead = now + 0.025;
+      this.audibleAt = performance.now() + (this.playhead - now) * 1000;
     }
     source.start(this.playhead);
     this.playhead += buffer.duration;
@@ -286,6 +301,7 @@ export class Playback {
     }
     this.sources.clear();
     this.playhead = 0;
+    this.audibleAt = null;
     const now = this.context.currentTime;
     const gain = this.gain.gain;
     gain.cancelScheduledValues(now);
@@ -296,6 +312,7 @@ export class Playback {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.audibleAt = null;
     for (const source of this.sources) {
       try {
         source.stop();
