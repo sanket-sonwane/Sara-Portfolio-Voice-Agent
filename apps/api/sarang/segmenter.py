@@ -83,11 +83,13 @@ def _is_safe_boundary(text: str, punctuation_index: int) -> bool:
 @dataclass
 class TextSegmenter:
     min_words_first: int = 3
-    max_words_first: int = 16
-    max_words: int = 26
-    min_chars: int = 16
-    max_chars: int = 160
-    first_hold_ms: int = 260
+    max_words_first: int = 14
+    max_words: int = 24
+    min_chars: int = 14
+    max_chars: int = 150
+    # Release the first speakable chunk quickly so TTS can start while the
+    # model is still generating; later segments prefer natural phrasing.
+    first_hold_ms: int = 120
 
     _buffer: str = ""
     _first_released: bool = False

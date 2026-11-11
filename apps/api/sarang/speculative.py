@@ -74,7 +74,7 @@ class Speculator:
         *,
         enabled: bool = True,
         min_words: int = 4,
-        stable_hits: int = 2,
+        stable_hits: int = 1,
         armer: Callable[[Speculation], Awaitable[bool]] | None = None,
         max_arms: int = 60,
     ) -> None:
@@ -123,6 +123,8 @@ class Speculator:
             previous, self._candidate = self._candidate, None
             if previous is not None:
                 self.discard(previous)
+        # Arm as soon as we have a usable hypothesis; identical repeats are
+        # deduped below so we don't re-arm the same text.
         if self._hits < self.stable_hits:
             return None
         if self._candidate is not None and self._candidate.text == text:

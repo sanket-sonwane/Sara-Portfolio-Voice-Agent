@@ -185,7 +185,9 @@ class Settings:
     # remains the safety fallback.
     endpoint_early_silence_ms: int = 0
     endpoint_min_speech_ms: int = 120
-    endpoint_hangover_ms: int = 250
+    # Lower hangover reduces fallback endpoint latency; keep enough to protect
+    # soft word endings. VAD speech-end requires max(silence_ms, hangover_ms).
+    endpoint_hangover_ms: int = 180
     # Audio sent to the recogniser, in seconds, kept from before the VAD fires.
     endpoint_preroll_ms: int = 800
     # VAD sensitivity (tune for noisy/quiet rooms; defaults match ADR 0003).
@@ -365,7 +367,7 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         endpoint_silence_ms=integer("ENDPOINT_SILENCE_MS", 800),
         endpoint_early_silence_ms=integer("ENDPOINT_EARLY_SILENCE_MS", 0),
         endpoint_min_speech_ms=integer("ENDPOINT_MIN_SPEECH_MS", 120),
-        endpoint_hangover_ms=integer("ENDPOINT_HANGOVER_MS", 250),
+        endpoint_hangover_ms=integer("ENDPOINT_HANGOVER_MS", 180),
         endpoint_preroll_ms=integer("ENDPOINT_PREROLL_MS", 800),
         vad_threshold_dbfs=number("VAD_THRESHOLD_DBFS", -55.0),
         vad_adaptive_margin_db=number("VAD_ADAPTIVE_MARGIN_DB", 9.0),

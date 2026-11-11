@@ -119,8 +119,14 @@ async def test_reset_cancels_a_running_arm_and_counts_the_waste():
     assert task.cancelled()
     assert cancelled
     assert speculator.arm_wasted == 1
-    # The next note starts from a clean slate.
-    assert await speculator.note(PARTIAL) is None
+    # The next note starts from a clean slate (fresh candidate, stale arm gone).
+    fresh = await speculator.note(PARTIAL)
+    assert fresh is not None
+    assert fresh is not candidate
+    assert fresh.arm_task is not task
+    if fresh.arm_task is not None:
+        fresh.arm_task.cancel()
+        await asyncio.gather(fresh.arm_task, return_exceptions=True)
 
 
 # ------------------------------------------------------- replay end to end
