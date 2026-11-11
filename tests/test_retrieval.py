@@ -48,3 +48,20 @@ def test_scores_are_sorted_descending():
     results = LocalRetriever().search("multi agent orchestrator adversarial API testing", 4)
     scores = [chunk.score for chunk in results]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_filler_words_do_not_change_tier2_results():
+    """Discourse markers stopped in both indexes: identical tokens, identical ranks.
+
+    Before the fix "however"/"mean" and question words like "what"/"did"
+    survived into the BM25 query while the corpus kept its own copies of the
+    function words, so filler-laden queries ranked differently from clean ones.
+    """
+    retriever = LocalRetriever()
+    clean = retriever.search("what did he build during the arai internship", 4)
+    noisy = retriever.search(
+        "however i mean what did he build during the arai internship", 4
+    )
+
+    assert clean
+    assert [chunk.doc_id for chunk in noisy] == [chunk.doc_id for chunk in clean]

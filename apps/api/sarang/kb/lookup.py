@@ -19,6 +19,15 @@ from dataclasses import dataclass, field
 
 from .loader import FactBlock, KnowledgeBase
 
+# Stopwords for *scoring*: what survives tokenization is the topical set of a
+# query. It includes discourse markers and filled pauses - "however", "mean",
+# "well" - because they otherwise score like ordinary keywords. Measured:
+# none of these tokens appear in any fact block (df = 0), so they can never
+# help a match - but they poison the topical set (the generic-project subset
+# test failed: "however i mean what projects" was no longer a subset of
+# GENERIC_PROJECT_TOKENS, and the router picked profile + three arbitrary
+# blocks instead of the portfolio overview) and they travel into the tier-2
+# query and the model prompt as if they carried meaning.
 STOPWORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "do", "does", "did", "have", "has", "had", "will", "would", "can", "could",
@@ -32,9 +41,51 @@ STOPWORDS = {
     "just", "very", "really", "actually", "kind", "sort", "thing", "things",
     "know", "think", "want", "like", "get", "got", "make", "made", "use",
     "used", "using", "work", "works", "worked", "working", "done",
+    # Discourse markers and filled pauses.
+    "however", "mean", "well", "anyway", "basically", "maybe", "probably",
+    "honestly", "literally", "yeah", "okay", "ok", "alright", "hmm", "um",
+    "uh", "eh", "huh", "kinda", "sorta",
 }
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9+.#_-]*")
+
+# Words said *around* a question, not part of it. The prefix pattern is
+# repeated on purpose: visitors stack markers ("well, i mean, however...").
+# The separator is mandatory ([,\s]+): an optional one would let "so" eat the
+# head of "solomon".
+DISCOURSE_PREFIX_RE = re.compile(
+    r"^(?:(?:however|well|okay|ok|yeah|alright|hmm+|um+|uh+|eh+|huh|"
+    r"basically|actually|anyway|maybe|i mean|you know|like|so|right)"
+    r"[,\s]+)+",
+    re.IGNORECASE,
+)
+# Filled pauses in the middle of a sentence, with the separator that
+# surrounds them: removing "you know" from "build, you know, during" must not
+# leave "build, during" behind.
+FILLED_PAUSE_RE = re.compile(
+    r"(?:\s*,\s*|\s+)\b(?:i mean|you know|hmm+|um+|uh+|eh+|huh)\b[\s,]*",
+    re.IGNORECASE,
+)
+
+
+def strip_discourse(text: str) -> str:
+    """Return ``text`` without the words wrapped around the question.
+
+    The transcript card keeps what the visitor actually said; the router,
+    the retriever and the model get the question itself. Without this the
+    measured damage was concrete: ``lookup("what projects did he build")``
+    returned the portfolio overview while ``lookup("however i mean what
+    projects did he build")`` returned profile + three arbitrary blocks -
+    the fillers broke the generic-project subset test and reached the model
+    as query text. Routing patterns match on content words that survive the
+    strip, and the guard keeps a marker-only utterance from becoming an
+    empty query.
+    """
+    cleaned = text.strip()
+    for _ in range(2):
+        cleaned = DISCOURSE_PREFIX_RE.sub("", cleaned)
+        cleaned = " ".join(FILLED_PAUSE_RE.sub(" ", cleaned).split())
+    return cleaned or text.strip()
 
 
 def tokenize(text: str) -> list[str]:

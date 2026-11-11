@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sarang.kb.lookup import lookup, tokenize
+from sarang.kb.lookup import lookup, strip_discourse, tokenize
 
 
 def test_cgpa_routes_to_education():
@@ -103,3 +103,51 @@ def test_payload_is_json_safe():
     assert payload["ids"]
     assert isinstance(payload["scores"], dict)
     assert all(isinstance(value, float) for value in payload["scores"].values())
+
+
+# ---------------------------------------------------------------- discourse
+# Regressions for the measured filler damage: "however i mean" turned the
+# portfolio overview into profile + three arbitrary blocks, because discourse
+# markers survived tokenization as topical keywords (df = 0 in the corpus, so
+# they could never help a match - only poison the topical set).
+
+
+def test_discourse_markers_are_not_keywords():
+    tokens = tokenize("However, I mean, what did he build during the ARAI internship")
+    assert "however" not in tokens
+    assert "mean" not in tokens
+    assert "arai" in tokens
+
+
+def test_filler_words_do_not_change_routing():
+    clean = lookup("what projects did he build")
+    noisy = lookup("however i mean what projects did he build")
+
+    assert clean.reason == "generic project overview"
+    assert noisy.reason == clean.reason
+    assert [block.id for block in noisy.blocks] == [block.id for block in clean.blocks]
+
+    clean = lookup("what has he built")
+    noisy = lookup("i mean like what has he built")
+    assert noisy.reason == clean.reason
+    assert [block.id for block in noisy.blocks] == [block.id for block in clean.blocks]
+
+
+def test_strip_discourse_removes_only_the_wrapping():
+    assert strip_discourse("well, i mean, however what projects did he build") == (
+        "what projects did he build"
+    )
+    assert strip_discourse("what did he build, you know, during the arai internship") == (
+        "what did he build during the arai internship"
+    )
+    assert strip_discourse("tell me about his salary") == "tell me about his salary"
+    # A marker may never eat into a content word, and a marker-only utterance
+    # may never become an empty query.
+    assert strip_discourse("solomon says hi") == "solomon says hi"
+    assert strip_discourse("however") == "however"
+
+
+def test_intent_survives_the_strip():
+    """The strip runs before routing; intent patterns match on content words."""
+    assert lookup(strip_discourse("well however what is his salary")).blocked
+    assert lookup(strip_discourse("i mean like what did he do at arai")).top is not None

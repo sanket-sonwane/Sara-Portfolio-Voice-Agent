@@ -25,6 +25,17 @@ def test_system_prompt_states_the_grounding_rules():
     assert "only if the visitor asks" in lowered
 
 
+def test_system_prompt_forbids_filler_openers():
+    """The model must not wrap answers in 'However,' / 'I mean' discourse.
+
+    The visitor complained about exactly this: answers that open with the
+    same filler words the recogniser transcribes from speech.
+    """
+    lowered = SYSTEM_PROMPT.lower()
+    assert "never open with filler" in lowered
+    assert "'i mean'" in lowered
+
+
 def test_lexicon_is_only_added_within_budget():
     base = build_system()
     assert base == SYSTEM_PROMPT

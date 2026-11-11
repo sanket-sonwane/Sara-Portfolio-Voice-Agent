@@ -93,6 +93,27 @@ async def test_history_is_kept_for_follow_ups(orchestrator, session):
     assert len(session.history) <= 8
 
 
+async def test_fillers_reach_the_card_but_not_the_router(orchestrator, session):
+    """Display honesty and routing accuracy at once.
+
+    The transcript card shows what the visitor said; the lookup that picks
+    the evidence sees the question without the discourse wrapped around it.
+    """
+    key, queue = orchestrator.registry.bus.subscribe()
+    await orchestrator.run_turn(session, "however i mean what projects did he build")
+    events = await collect(queue, "metrics.turn")
+
+    transcript = [
+        event for event in events if event.type.value == "transcript.final"
+    ][0].payload["text"]
+    assert transcript == "however i mean what projects did he build"
+
+    evidence = [event for event in events if event.type.value == "evidence"][0]
+    lookup_payload = evidence.payload["lookup"]
+    assert lookup_payload["query"] == "what projects did he build"
+    assert lookup_payload["reason"] == "generic project overview"
+
+
 async def test_final_answer_is_published_before_metrics(orchestrator, session):
     key, queue = orchestrator.registry.bus.subscribe()
     await orchestrator.run_turn(session, "What is TattvaQuest?")

@@ -30,7 +30,7 @@ import numpy as np
 
 from . import AGENT_NAME
 from .config import REPO_ROOT, Settings
-from .kb.lookup import LookupResult, lookup
+from .kb.lookup import LookupResult, lookup, strip_discourse
 from .kb.render import render_context, render_evidence, render_overview
 from .kb.retrieval import Chunk, search_docs
 from .llm import build_llm
@@ -496,6 +496,11 @@ class Orchestrator:
                 turn_id=runtime.turn_id,
                 generation=generation,
             )
+
+        # The card has shown what the visitor said (voice published the raw
+        # transcript before the turn started); the router, the retriever and
+        # the model get the question without the discourse wrapped around it.
+        text = strip_discourse(text)
 
         # ---------------------------------------------------------- tier-1 lookup
         runtime.marks.enter("lookup")
