@@ -63,11 +63,34 @@ it were tried and rejected on evidence:
 Closing the recogniser early and reopening it on resume fails the same way: the
 join is ungrammatical (`"What did Sanket Built during the ARAI internship."`)
 because the provider starts a new segment with a capital, and a finalize on
-trailing silence produced a spurious `"I"`. The 800 ms stays. The only shape
-that could recover the final's ~175 ms without touching turn-taking is a second,
-speculative recogniser that replays the buffered utterance during the window and
-never closes the live turn — a project with a marginal payoff, not a config
-change, and not started without evidence it is needed.
+trailing silence produced a spurious `"I"`. The 800 ms stays.
+
+**The speculative recogniser is blocked by the provider plan.** The remaining
+safe shape was a second recogniser that never touches the live turn: feed it the
+same audio in parallel, close it at ~500 ms of silence, and use its final when
+the window expires. `bench/probe/asr_speculation.py` measured two things:
+
+1. It does not fit. The speculative finalize took 274 ms and 676 ms in
+   consecutive runs, against a ~300 ms budget, so it would sometimes arrive too
+   late to be used — the worst of both worlds, paying for a second recogniser
+   and still waiting.
+2. It cannot be opened at all. A second concurrent realtime ASR socket is
+   refused with `rate_limit_exceeded`, and the refusal sometimes takes the live
+   socket down with it; a single socket connects immediately afterwards. This
+   account's plan supports one realtime ASR connection, so any design that
+   doubles them — parallel feed or burst replay — is unavailable, and would also
+   multiply with session count in production.
+
+The one single-socket lever was also measured and is not one.
+`bench/probe/asr_final_tail.py` compares the adapter's chunking: 20 ms chunks
+give 297 ms p50 from `speech_end` to final against 221 ms at 50 ms, because the
+smaller chunk sends five times as many messages without reducing what the
+provider has to process. Production already runs 100 ms at ~175 ms p50, so the
+differences are provider noise and the tail is not ours to shorten.
+
+Endpointing and ASR finalization are therefore both closed: 800 ms because the
+measured pause floor demands it, and `asr_final` because the only ways to overlap
+it are refused by the plan or slower than waiting.
 
 
 ## 2. One recogniser socket per connection, not one per utterance
