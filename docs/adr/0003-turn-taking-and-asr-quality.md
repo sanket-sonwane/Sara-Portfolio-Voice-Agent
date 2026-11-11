@@ -39,6 +39,36 @@ cannot clip soft word endings. The decision above is unchanged — the point is
 that the number in the config is now the number charged, which is what the plan
 and the budget both assume. See Phase 0 §6, "Latency pass 2".
 
+**Why it cannot be made adaptive (measured, not assumed).** Endpointing is the
+largest remaining term, so it is the obvious target, and two ways of shortening
+it were tried and rejected on evidence:
+
+1. *A shorter window.* `bench/probe/pause_profile.py` measures the silences
+   inside a normally-spoken question with the gateway's own VAD. The reference
+   question — "What did Sanket build during the ARAI internship?" — has a **460 ms**
+   pause between "Sanket" and "build". Any window at or below 450 ms therefore
+   cuts a question that was spoken correctly and completely. Confirmed end to
+   end: closing the recogniser 450 ms into a pause returned the final
+   `"What did Sanket"`. 500 ms is the first value that survives this one sample,
+   which is consistent with the real cut-offs that produced this ADR at 500 ms.
+2. *Trusting the partial.* `bench/probe/endpoint_evidence.py` records what the
+   live partial says at each candidate cutoff. During a mid-sentence pause the
+   partial was `"What did Sanket build during the ARII internship?"` — complete,
+   punctuated, and stable for over a second — while the visitor was still
+   talking. Re-running the identical audio produced `"What did Sanket"` instead,
+   so the signal is not reproducible either. A partial ending in punctuation is
+   not evidence that a sentence ended, and a partial that looks stable may be a
+   hallucinated completion.
+
+Closing the recogniser early and reopening it on resume fails the same way: the
+join is ungrammatical (`"What did Sanket Built during the ARAI internship."`)
+because the provider starts a new segment with a capital, and a finalize on
+trailing silence produced a spurious `"I"`. The 800 ms stays. The only shape
+that could recover the final's ~175 ms without touching turn-taking is a second,
+speculative recogniser that replays the buffered utterance during the window and
+never closes the live turn — a project with a marginal payoff, not a config
+change, and not started without evidence it is needed.
+
 
 ## 2. One recogniser socket per connection, not one per utterance
 
