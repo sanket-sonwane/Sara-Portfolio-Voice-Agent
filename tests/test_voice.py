@@ -274,3 +274,111 @@ async def test_partial_transcript_warms_speculation_without_discourse(engine, fa
         assert session.speculation.prepared >= 1
     finally:
         await loop.close()
+
+
+async def test_guarded_early_endpoint_closes_on_stable_punctuated_partial(
+    engine, fake_asr, monkeypatch
+):
+    """A complete, stable sentence can end the turn at the early silence floor.
+
+    The full 800 ms window is the safe default for mid-thought pauses; when the
+    recogniser already holds a terminally-punctuated partial that has stopped
+    changing, 500 ms of silence is enough (and 460 ms internal pauses measured
+    in ADR 0003 still cannot trigger it).
+    """
+    captured: dict = {}
+
+    async def run_turn(session, text, **kwargs):
+        captured["marks"] = kwargs.get("marks")
+
+    monkeypatch.setattr(engine, "run_turn", run_turn)
+
+    session = engine.create_session("test")
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+
+        await fake_asr._events.put(
+            ASREvent(text="What did he build at ARAI?", final=False, utterance=0)
+        )
+        # Let the reader consume the partial, then push enough silence for it
+        # to be considered stable (>= 300 ms unchanged) before the early floor
+        # is reached.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        for _ in range(20):  # 400 ms of silence: stable, but below 500 ms floor
+            await loop.push(silence(20))
+        assert loop._final_task is None
+
+        for _ in range(10):  # crosses the 500 ms early floor
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        marks = captured.get("marks")
+        assert marks is not None
+        endpoint = marks.durations().get("endpoint")
+        assert endpoint is not None
+        # Closed early: well below the 800 ms default window.
+        assert 480 <= endpoint <= 560
+    finally:
+        await loop.close()
+
+
+async def test_unpunctuated_partial_waits_for_the_full_silence_window(
+    engine, fake_asr, monkeypatch
+):
+    """Without terminal punctuation there is no early close - only silence counts.
+
+    A partial that trails off without sentence-ending punctuation is exactly
+    the mid-thought case the 800 ms window exists to protect.
+    """
+    captured: dict = {}
+
+    async def run_turn(session, text, **kwargs):
+        captured["marks"] = kwargs.get("marks")
+
+    monkeypatch.setattr(engine, "run_turn", run_turn)
+
+    session = engine.create_session("test")
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+
+        await fake_asr._events.put(
+            ASREvent(text="What did he build at ARAI", final=False, utterance=0)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # 600 ms of silence would be enough for an early close if it were
+        # allowed; without punctuation it must not fire.
+        for _ in range(30):
+            await loop.push(silence(20))
+        assert loop._final_task is None
+
+        for _ in range(30):  # reach the full 800 ms window (+ hangover floor)
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        marks = captured.get("marks")
+        assert marks is not None
+        endpoint = marks.durations().get("endpoint")
+        assert endpoint is not None
+        assert round(endpoint) == 800
+    finally:
+        await loop.close()

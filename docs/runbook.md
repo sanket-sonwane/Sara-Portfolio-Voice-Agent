@@ -240,7 +240,8 @@ If `eos_to_answer_audio_ms` regresses:
 | `/api/offer` returns 503 | `aiortc` not installed | expected; browser uses `/ws/audio` |
 | Answers are generic/refusals | LLM unavailable, local answerer active | check `llm_ready`; local answers are grounded but extractive |
 | `retrieval` says `bm25-local (database unreachable)` | bad `DATABASE_URL` | fix the DSN or unset it; BM25 is fine |
-| High `wasted` speculation | prefetch misses | lower `SPECULATIVE_MS` or disable it |
+| High `wasted` / `arm_wasted` speculation | partials don't match finals, or evidence/prompt gates refuse the arm | check `/api/metrics` `speculation` (`prepared`/`adopted`/`wasted` for lookup, `armed`/`arm_adopted`/`arm_wasted` for LLM); disable with `SPECULATIVE_LLM=false` or `SPECULATION_ENABLED=false` |
+| Voice turns still wait the full silence window on clear sentences | early endpointing disabled or gated out | `ENDPOINT_EARLY_SILENCE_MS` (default 500, 0 disables) closes early only when the partial is stable and terminally-punctuated; mid-thought pauses keep the 800 ms `ENDPOINT_SILENCE_MS` floor |
 | `fly deploy` fails with "insufficient CPUs available … on the current host" | the `sin` host has no room for an in-place machine update | `fly deploy --strategy immediate` replaces the machine instead of updating it; the volume and secrets are untouched |
 
 ## 8. Rollback

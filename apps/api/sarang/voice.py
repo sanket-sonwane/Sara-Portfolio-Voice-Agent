@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -96,12 +97,18 @@ class UtteranceLoop:
         self._ring_limit = max(3_200, settings.endpoint_preroll_ms * _BYTES_PER_MS)
         self._dump_dir = Path(settings.asr_dump_dir) if settings.asr_dump_dir else None
         self._final_timeout = settings.asr_final_timeout_s
+        self._early_silence_ms = settings.endpoint_early_silence_ms
         # Media clock and the moment the closing silence window opened. The
         # endpoint cost is measured in *media* time, not wall clock: a test (or
         # a burst replay) pushes frames faster than real time, and a wall-clock
         # difference would then report milliseconds for an 800 ms window.
         self._media_ms = 0.0
         self._silence_onset: float | None = None
+        # When the recogniser last changed the partial for this utterance.
+        # A stable, terminally-punctuated partial is the only evidence strong
+        # enough to justify closing the turn before the full silence window.
+        self._partial_changed_at = 0.0
+        self._terminal_re = re.compile(r'[.!?…]["\')\]]?\s*$')
 
     # ------------------------------------------------------------------ input
 
@@ -156,6 +163,23 @@ class UtteranceLoop:
                     {"text": utterance.latest, "source": "voice"},
                 )
 
+        if (
+            not update.speech_ended
+            and self._capturing
+            and not self._finalizing
+            and self._silence_onset is not None
+        ):
+            silence_ms = self._media_ms - self._silence_onset
+            if self._can_close_early(silence_ms):
+                # The recogniser already has a complete sentence and the
+                # visitor has been silent long enough that this is very
+                # unlikely to be a mid-thought pause. Close now; the VAD's
+                # own 800 ms window would have reached the same conclusion
+                # later. endpoint_ms is the observed silence, not the
+                # configured ceiling.
+                self._capturing = False
+                self._start_finalize(max(0.0, silence_ms))
+
         if update.speech_ended and self._capturing:
             self._capturing = False
             self._start_finalize(endpoint_ms)
@@ -166,6 +190,33 @@ class UtteranceLoop:
         while self._ring_bytes > self._ring_limit and self._ring:
             dropped = self._ring.popleft()
             self._ring_bytes -= len(dropped)
+
+    def _can_close_early(self, silence_ms: float) -> bool:
+        """True only when a shorter silence is safe evidence the turn is over.
+
+        A partial can look finished during a mid-sentence pause (ADR 0003
+        records a 460 ms pause inside a correctly-spoken question where the
+        partial was already punctuated and stable). The guard therefore
+        requires all of: enough observed silence (>= early threshold, and the
+        threshold itself stays above that measured pause), a terminally-
+        punctuated partial, and a partial that has not changed for a
+        meaningful stretch - so the recogniser is not still revising it.
+        Anything uncertain keeps the full 800 ms window.
+        """
+        early = self._early_silence_ms
+        if early <= 0 or silence_ms < early:
+            return False
+        utterance = self.current
+        if utterance is None:
+            return False
+        text = (utterance.latest or "").strip()
+        if not text or self._terminal_re.search(text) is None:
+            return False
+        # Stable since at least 300 ms of media time ago. This rules out a
+        # partial that just acquired its final punctuation on this frame.
+        if self._partial_changed_at > self._media_ms - 300.0:
+            return False
+        return True
 
     async def _begin_utterance(self) -> None:
         session = self.session
@@ -203,6 +254,7 @@ class UtteranceLoop:
         # Sarvam's utterance counter is zero-based for the session.
         self._pending[utterance.index - 1] = utterance
         self._capturing = True
+        self._partial_changed_at = self._media_ms
 
         await self.asr.begin_utterance()
         preroll = list(self._ring)
@@ -277,7 +329,10 @@ class UtteranceLoop:
                     utterance.event.set()
                     # Keep reading: one socket serves the whole conversation.
                     continue
-                utterance.latest = normalize_transcript(event.text)
+                text = normalize_transcript(event.text)
+                if text != utterance.latest:
+                    utterance.latest = text
+                    self._partial_changed_at = self._media_ms
                 if utterance is self.current:
                     self.session.publish(
                         EventType.TRANSCRIPT_PARTIAL,

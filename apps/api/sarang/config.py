@@ -172,10 +172,16 @@ class Settings:
     # Behaviour
     # Endpointing is the single biggest cause of "it talks over me": an
     # energy VAD hears the tail of a word as silence, so a 500 ms window closes
-    # the turn mid-sentence. 800 ms is the conversational floor for accented
+    # the turn mid-sentence. 800 ms is the conservative floor for accented
     # speech; the pre-roll buffer in the utterance loop makes the extra wait
     # invisible (no audio is lost at the start of the next utterance).
     endpoint_silence_ms: int = 800
+    # Guarded early close: when the recogniser's partial is a stable,
+    # terminally-punctuated sentence, a 500 ms silence is enough to know the
+    # visitor stopped (measured mid-sentence pauses reach 460 ms, so the
+    # threshold must stay above them; 200-300 ms needs a learned turn
+    # detector and is intentionally not attempted here). 0 disables.
+    endpoint_early_silence_ms: int = 500
     endpoint_min_speech_ms: int = 120
     endpoint_hangover_ms: int = 250
     # Audio sent to the recogniser, in seconds, kept from before the VAD fires.
@@ -351,6 +357,7 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         database_url=get("DATABASE_URL"),
         cache_dir=get("SARANG_CACHE_DIR"),
         endpoint_silence_ms=integer("ENDPOINT_SILENCE_MS", 800),
+        endpoint_early_silence_ms=integer("ENDPOINT_EARLY_SILENCE_MS", 500),
         endpoint_min_speech_ms=integer("ENDPOINT_MIN_SPEECH_MS", 120),
         endpoint_hangover_ms=integer("ENDPOINT_HANGOVER_MS", 250),
         endpoint_preroll_ms=integer("ENDPOINT_PREROLL_MS", 800),

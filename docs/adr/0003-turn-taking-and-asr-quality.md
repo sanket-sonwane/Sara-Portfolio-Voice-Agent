@@ -105,6 +105,20 @@ Endpointing and ASR finalization are therefore both closed: 800 ms because the
 measured pause floor demands it, and `asr_final` because every way to overlap it
 is refused by the plan, slower than waiting, or less accurate.
 
+**Guarded early close (same day, later).** The 800 ms window is the conservative
+default, but it is not always necessary to wait that long: when the recogniser's
+partial is already a complete sentence and has stopped changing, the visitor has
+very likely finished. The utterance loop may now close the turn at
+`ENDPOINT_EARLY_SILENCE_MS` (default 500 ms, never below the 460 ms mid-sentence
+pause measured above) only when all of: observed silence has reached that floor,
+the partial ends with terminal punctuation, and the partial has been stable for
+at least 300 ms of media time. A partial that is still revising, or one without
+sentence-ending punctuation, keeps the full 800 ms window — the exact
+mid-thought case the window exists to protect. This does not contradict the
+evidence in (2): punctuation and stability are not trusted *alone*, the silence
+floor stays above the measured internal pause, and the aggressive 200–300 ms
+range remains parked behind a learned turn detector and real recordings.
+
 
 ## 2. One recogniser socket per connection, not one per utterance
 
