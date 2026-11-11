@@ -109,7 +109,11 @@ class SarvamASR(ASRSession):
         self._session_ready = asyncio.Event()
         self._server_config: dict = {}
         self._buffer = bytearray()
-        self._chunk_bytes = max(320, self.sample_rate * self.chunk_ms // 1000 * 2)
+        # Keep outbound chunks in a stable range to balance partial latency
+        # and recognition stability while preserving explicit small-chunk
+        # configurations used by tests/probes.
+        clamped_chunk_ms = min(max(self.chunk_ms, 20), 200)
+        self._chunk_bytes = max(320, self.sample_rate * clamped_chunk_ms // 1000 * 2)
         self.last_error = ""
 
     # ------------------------------------------------------------------ config

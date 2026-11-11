@@ -382,3 +382,102 @@ async def test_unpunctuated_partial_waits_for_the_full_silence_window(
         assert round(endpoint) == 800
     finally:
         await loop.close()
+
+
+async def test_filler_only_punctuated_partial_does_not_close_early(
+    engine, fake_asr, monkeypatch
+):
+    """A discourse-only fragment must not end the turn at the early floor.
+
+    ASR can punctuate fillers ("However, I mean.") while the visitor is only
+    pausing before the real question. Closing early would pass the preamble to
+    the model and drop the question - the "only fillers recognised" failure.
+    """
+    captured: dict = {}
+
+    async def run_turn(session, text, **kwargs):
+        captured["marks"] = kwargs.get("marks")
+
+    monkeypatch.setattr(engine, "run_turn", run_turn)
+
+    session = engine.create_session("test")
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+
+        # Stable, punctuated, but pure discourse - not a completed question.
+        await fake_asr._events.put(
+            ASREvent(text="However, I mean.", final=False, utterance=0)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # Well past the early floor; must NOT trigger an early close.
+        for _ in range(30):
+            await loop.push(silence(20))
+        assert loop._final_task is None
+
+        for _ in range(30):  # reach the full 800 ms window
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        marks = captured.get("marks")
+        assert marks is not None
+        endpoint = marks.durations().get("endpoint")
+        assert endpoint is not None
+        assert round(endpoint) == 800
+    finally:
+        await loop.close()
+
+
+async def test_punctuated_substantive_statement_can_close_early(
+    engine, fake_asr, monkeypatch
+):
+    """A period-ending but contentful statement is still safe to close early."""
+    captured: dict = {}
+
+    async def run_turn(session, text, **kwargs):
+        captured["marks"] = kwargs.get("marks")
+
+    monkeypatch.setattr(engine, "run_turn", run_turn)
+
+    session = engine.create_session("test")
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+
+        await fake_asr._events.put(
+            ASREvent(text="Tell me about ARAI.", final=False, utterance=0)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        for _ in range(20):
+            await loop.push(silence(20))
+        assert loop._final_task is None
+
+        for _ in range(10):  # crosses the 500 ms early floor
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        marks = captured.get("marks")
+        assert marks is not None
+        endpoint = marks.durations().get("endpoint")
+        assert endpoint is not None
+        assert 480 <= endpoint <= 560
+    finally:
+        await loop.close()

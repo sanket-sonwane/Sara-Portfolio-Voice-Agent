@@ -43,7 +43,7 @@ from .asr import build_asr
 from .asr.normalize import normalize_transcript
 from .audio.frames import frame_bytes, to_int16
 from .audio.vad import Vad, VadConfig
-from .kb.lookup import strip_discourse
+from .kb.lookup import strip_discourse, tokenize
 from .metrics import TurnMarks
 from .orchestrator import Orchestrator
 from .schemas import EventType, SessionState
@@ -73,6 +73,8 @@ class UtteranceLoop:
         settings = session.settings
         self.vad = Vad(
             VadConfig(
+                threshold_dbfs=settings.vad_threshold_dbfs,
+                adaptive_margin_db=settings.vad_adaptive_margin_db,
                 silence_ms=settings.endpoint_silence_ms,
                 min_speech_ms=settings.endpoint_min_speech_ms,
                 hangover_ms=settings.endpoint_hangover_ms,
@@ -135,7 +137,10 @@ class UtteranceLoop:
             if self._silence_onset is not None:
                 endpoint_ms = max(0.0, self._media_ms - self._silence_onset)
             self._silence_onset = None
-        elif self._capturing and update.silence_ms > 0.0:
+        elif self._capturing and (update.silence_ms > 0.0 or not update.speech):
+            # Track silence onset on any non-speech frame while capturing, even
+            # during hangover (where silence_ms may still be 0), so early
+            # content-based closing can react without waiting for timer windows.
             if self._silence_onset is None:
                 self._silence_onset = frame_start
         elif self._capturing:
@@ -197,24 +202,60 @@ class UtteranceLoop:
         A partial can look finished during a mid-sentence pause (ADR 0003
         records a 460 ms pause inside a correctly-spoken question where the
         partial was already punctuated and stable). The guard therefore
-        requires all of: enough observed silence (>= early threshold, and the
-        threshold itself stays above that measured pause), a terminally-
-        punctuated partial, and a partial that has not changed for a
-        meaningful stretch - so the recogniser is not still revising it.
-        Anything uncertain keeps the full 800 ms window.
+        requires all of: enough observed silence, a terminally-punctuated
+        partial, and a partial that has not changed for a meaningful stretch -
+        so the recogniser is not still revising it. Anything uncertain keeps
+        the full silence window.
+
+        ``endpoint_early_silence_ms == 0`` means "no added timer floor":
+        close as soon as content/stability evidence is strong once real
+        silence is observed, instead of imposing a fixed extra pause.
+        Negative disables this path.
+
+        Filler-led fragments ("However, I mean.", "Actually.") can be
+        punctuated and stable while the visitor is only pausing before the
+        real question; closing on them would pass only the preamble to the
+        model. A bare period/ellipsis therefore needs substantive content,
+        while '?'/'!' are strong end-of-utterance signals on their own.
         """
         early = self._early_silence_ms
-        if early <= 0 or silence_ms < early:
+        if early < 0:
+            return False
+        # A configured floor of 0 removes the *added* timer wait, but we still
+        # require a small amount of observed silence so we never close on a
+        # transient non-speech blip while the user is still forming words.
+        min_silence = float(early) if early > 0 else 120.0
+        if silence_ms < min_silence:
             return False
         utterance = self.current
         if utterance is None:
             return False
         text = (utterance.latest or "").strip()
-        if not text or self._terminal_re.search(text) is None:
+        match = self._terminal_re.search(text)
+        if not text or match is None:
             return False
         # Stable since at least 300 ms of media time ago. This rules out a
         # partial that just acquired its final punctuation on this frame.
-        if self._partial_changed_at > self._media_ms - 300.0:
+        # With no added timer wait requested, require more stability so a
+        # freshly-punctuated partial has time to settle/revise.
+        stable_ms = 300.0 if early > 0 else 500.0
+        if self._partial_changed_at > self._media_ms - stable_ms:
+            return False
+
+        terminal = match.group(0).lstrip()
+        # Question/exclamation marks are strong completion signals. A period
+        # or ellipsis is ambiguous: disfluencies and trailing fillers are
+        # often punctuated as sentences, so require real content.
+        if terminal.startswith("?") or terminal.startswith("!"):
+            return True
+
+        stripped = strip_discourse(text)
+        # A fragment that is only discourse/fillers ("I mean.", "Actually.")
+        # must never end the turn early - the visitor is likely about to ask.
+        if not stripped:
+            return False
+        topical = tokenize(stripped)
+        if not topical and len(stripped.split()) <= 4:
             return False
         return True
 
@@ -386,6 +427,16 @@ class UtteranceLoop:
             if utterance is None:
                 return
             marks.enter("asr_final")
+            # Overlap: while waiting for the provider's final transcript,
+            # warm/adopt speculation from the latest partial so lookup and a
+            # speculative LLM arm can run during ASR finalization instead of
+            # after it. If the final differs, consume()'s gates refuse it.
+            if utterance.latest:
+                spec = self.session.speculation
+                if spec is not None:
+                    asyncio.create_task(
+                        spec.note(strip_discourse(utterance.latest))
+                    )
             if self.asr is not None:
                 with contextlib.suppress(Exception):
                     await self.asr.finalize()

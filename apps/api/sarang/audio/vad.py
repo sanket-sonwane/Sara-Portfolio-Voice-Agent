@@ -122,8 +122,15 @@ class Vad:
         return float(np.std(list(self._levels)))
 
     def _is_speech(self, level: float, zcr: float, modulation: float) -> bool:
-        threshold = max(self.config.threshold_dbfs, self.noise_floor + self.config.adaptive_margin_db)
+        threshold = max(
+            self.config.threshold_dbfs,
+            self.noise_floor + self.config.adaptive_margin_db,
+        )
+        if level <= threshold:
+            return False
         # A pure tone or a very steady hum leaks energy with almost no crossings.
+        # Only reject when barely above threshold; clearly loud signals should
+        # still be considered.
         if zcr < 0.005 and level < threshold + 6:
             return False
         # Steady sound is never speech: a hum, a fan or a noise floor sits at a
@@ -132,7 +139,7 @@ class Vad:
         # ambient noise at or above the floor opens a turn that never ends.
         if modulation < self.config.steady_max_db:
             return False
-        return level > threshold
+        return True
 
     def push(self, samples: np.ndarray, sample_rate: int = 16_000) -> VadUpdate:
         step_ms = len(samples) / sample_rate * 1000.0

@@ -177,15 +177,21 @@ class Settings:
     # invisible (no audio is lost at the start of the next utterance).
     endpoint_silence_ms: int = 800
     # Guarded early close: when the recogniser's partial is a stable,
-    # terminally-punctuated sentence, a 500 ms silence is enough to know the
-    # visitor stopped (measured mid-sentence pauses reach 460 ms, so the
-    # threshold must stay above them; 200-300 ms needs a learned turn
-    # detector and is intentionally not attempted here). 0 disables.
-    endpoint_early_silence_ms: int = 500
+    # terminally-punctuated sentence with substantive content, close without
+    # waiting the full fallback window. A positive value is the minimum
+    # observed silence (ms); 0 means "no added timer wait" (close on strong
+    # content/stability once real silence is observed, minimal floor) for
+    # lowest latency; negative disables this path. The full silence window
+    # remains the safety fallback.
+    endpoint_early_silence_ms: int = 0
     endpoint_min_speech_ms: int = 120
     endpoint_hangover_ms: int = 250
     # Audio sent to the recogniser, in seconds, kept from before the VAD fires.
     endpoint_preroll_ms: int = 800
+    # VAD sensitivity (tune for noisy/quiet rooms; defaults match ADR 0003).
+    # Raising the threshold/gate rejects more noise but can miss quiet speech.
+    vad_threshold_dbfs: float = -55.0
+    vad_adaptive_margin_db: float = 9.0
     # How long to wait for ``transcript.final`` before falling back to the last
     # partial. Answering from a partial is the last resort, not the default.
     asr_final_timeout_s: float = 3.5
@@ -357,10 +363,12 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         database_url=get("DATABASE_URL"),
         cache_dir=get("SARANG_CACHE_DIR"),
         endpoint_silence_ms=integer("ENDPOINT_SILENCE_MS", 800),
-        endpoint_early_silence_ms=integer("ENDPOINT_EARLY_SILENCE_MS", 500),
+        endpoint_early_silence_ms=integer("ENDPOINT_EARLY_SILENCE_MS", 0),
         endpoint_min_speech_ms=integer("ENDPOINT_MIN_SPEECH_MS", 120),
         endpoint_hangover_ms=integer("ENDPOINT_HANGOVER_MS", 250),
         endpoint_preroll_ms=integer("ENDPOINT_PREROLL_MS", 800),
+        vad_threshold_dbfs=number("VAD_THRESHOLD_DBFS", -55.0),
+        vad_adaptive_margin_db=number("VAD_ADAPTIVE_MARGIN_DB", 9.0),
         asr_final_timeout_s=number("ASR_FINAL_TIMEOUT_S", 3.5),
         asr_dump_dir=get("ASR_DUMP_DIR"),
         speculative_ms=integer("SPECULATIVE_MS", 0),
