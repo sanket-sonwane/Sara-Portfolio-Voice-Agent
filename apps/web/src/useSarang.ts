@@ -93,7 +93,24 @@ export interface Analysers {
   output: AnalyserNode | null;
 }
 
+/**
+ * One completed turn as the visitor experienced it. `server` is the gateway's
+ * own `eos_to_answer_audio_ms`; `client` is this browser's speech-end →
+ * audible. Both are absent when the turn was not a spoken question (a typed
+ * turn, a greeting, a barge-in), which is why they are optional rather than
+ * zero: a zero would read as a suspiciously fast turn.
+ */
+export interface TurnSample {
+  /** `text` for a typed question, otherwise the transcript source. */
+  source?: string;
+  /** Server: end of speech → the first frame actually left the process. */
+  first?: number;
+  server?: number;
+  client?: number;
+}
+
 const MAX_RECONNECTS = 6;
+const MAX_TURN_SAMPLES = 8;
 
 let transcriptSequence = 0;
 function nextTranscriptId(prefix: string): string {
@@ -164,6 +181,7 @@ export interface UseSarang {
   sources: api.EvidenceBlock[];
   evidence: EvidenceNote[];
   lastTurn: api.TurnMetrics | null;
+  turnLog: TurnSample[];
   metrics: api.MetricsResponse | null;
   browserStats: BrowserStats | null;
   connectMs: number | null;
@@ -199,6 +217,10 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
   const [sources, setSources] = useState<api.EvidenceBlock[]>([]);
   const [evidence, setEvidence] = useState<EvidenceNote[]>([]);
   const [lastTurn, setLastTurn] = useState<api.TurnMetrics | null>(null);
+  // A real-mic pass is read as a distribution, not a single number, and the
+  // drawer used to overwrite the previous turn every time. Keeping the recent
+  // samples is what makes four spoken questions reportable.
+  const [turnLog, setTurnLog] = useState<TurnSample[]>([]);
   const [metrics, setMetrics] = useState<api.MetricsResponse | null>(null);
   const [browserStats, setBrowserStats] = useState<BrowserStats | null>(null);
   const [connectMs, setConnectMs] = useState<number | null>(null);
@@ -669,16 +691,25 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           const turn = event.payload as unknown as api.TurnMetrics;
           const eos = eosAtRef.current;
           const audible = turnAudibleAtRef.current;
-          setLastTurn({
-            ...turn,
-            // Only meaningful when both stamps belong to the same turn and the
-            // answer came after the end of speech. Anything else is a text turn,
-            // a barge-in, or a greeting, and must not invent a number.
-            client_eos_to_audible_ms:
-              eos !== null && audible !== null && audible >= eos
-                ? Math.round(audible - eos)
-                : undefined,
-          });
+          // Only meaningful when both stamps belong to the same turn and the
+          // answer came after the end of speech. Anything else is a text turn,
+          // a barge-in, or a greeting, and must not invent a number.
+          const clientMs =
+            eos !== null && audible !== null && audible >= eos
+              ? Math.round(audible - eos)
+              : undefined;
+          setLastTurn({ ...turn, client_eos_to_audible_ms: clientMs });
+          if (turn.eos_to_answer_audio_ms !== undefined || clientMs !== undefined) {
+            setTurnLog((previous) => [
+              ...previous.slice(-(MAX_TURN_SAMPLES - 1)),
+              {
+                source: turn.source,
+                first: turn.eos_to_first_audio_ms,
+                server: turn.eos_to_answer_audio_ms,
+                client: clientMs,
+              },
+            ]);
+          }
           break;
         }
         case "epoch": {
@@ -1270,6 +1301,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
     sources,
     evidence,
     lastTurn,
+    turnLog,
     metrics,
     browserStats,
     connectMs,

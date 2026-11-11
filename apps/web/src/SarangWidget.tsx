@@ -89,6 +89,15 @@ function formatMs(value: number | undefined): string {
   return `${Math.round(value)} ms`;
 }
 
+function median(values: number[]): number | undefined {
+  if (!values.length) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
 function elapsedLabel(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
@@ -241,7 +250,25 @@ function Turn({ entry }: { entry: TranscriptEntry }) {
 // -------------------------------------------------------------- diagnostics
 
 function Diagnostics({ sarang }: { sarang: UseSarang }) {
-  const { config, lastTurn, metrics, browserStats, evidence, eventLog, transport, connectMs, audioRunning } = sarang;
+  const { config, lastTurn, turnLog, metrics, browserStats, evidence, eventLog, transport, connectMs, audioRunning } = sarang;
+  const turnStats = useMemo(() => {
+    // A typed turn skips endpointing and ASR entirely, so folding it into the
+    // same median would understate the number a real-mic pass is trying to
+    // measure. Only turns that began with speech are compared.
+    const spoken = turnLog.filter((sample) => sample.source !== "text");
+    const servers = spoken
+      .map((sample) => sample.server)
+      .filter((value): value is number => typeof value === "number");
+    const clients = spoken
+      .map((sample) => sample.client)
+      .filter((value): value is number => typeof value === "number");
+    return {
+      spoken: spoken.length,
+      typed: turnLog.length - spoken.length,
+      server: median(servers),
+      client: median(clients),
+    };
+  }, [turnLog]);
   const stageRows = useMemo(() => {
     const stages = metrics?.summary.stages ?? {};
     return Object.entries(stages)
@@ -274,24 +301,68 @@ function Diagnostics({ sarang }: { sarang: UseSarang }) {
       </section>
 
       <section>
+        <h4>This session</h4>
+        {turnLog.length ? (
+          <>
+            <p className="sarang-diag-lead">
+              {turnStats.spoken > 0 ? (
+                <>
+                  {turnStats.spoken} spoken turn{turnStats.spoken === 1 ? "" : "s"} ·
+                  server p50 <strong>{formatMs(turnStats.server)}</strong>
+                  {turnStats.client !== undefined && (
+                    <>
+                      {" · "}browser p50 <strong>{formatMs(turnStats.client)}</strong>
+                    </>
+                  )}
+                </>
+              ) : (
+                <>No spoken turns yet</>
+              )}
+              {turnStats.typed > 0 && <> · {turnStats.typed} typed</>}
+            </p>
+            {turnStats.spoken > 0 && turnStats.client === undefined && (
+              <p className="sarang-diag-foot">
+                The browser figure needs a spoken turn with the microphone enabled.
+              </p>
+            )}
+            <ul className="sarang-diag-list">
+              {turnLog.map((sample, index) => (
+                <li key={index}>
+                  {index + 1}. server {formatMs(sample.server)} · browser{" "}
+                  {formatMs(sample.client)}
+                  {sample.source === "text" && <> · typed</>}
+                  {sample.first !== undefined && sample.client !== undefined && (
+                    <> · +{Math.round(sample.client - sample.first)} ms network + playback</>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <p className="sarang-diag-foot">No answered turns yet.</p>
+        )}
+      </section>
+
+      <section>
         <h4>Last turn</h4>
         {lastTurn ? (
           <>
             <p className="sarang-diag-lead">
               End of speech → answer audio: <strong>{formatMs(lastTurn.eos_to_answer_audio_ms)}</strong>
-              {" · "}first audible (incl. filler): <strong>{formatMs(lastTurn.eos_to_first_audio_ms)}</strong>
+              {" · "}first audible (incl. egress and any filler):{" "}
+              <strong>{formatMs(lastTurn.eos_to_first_audio_ms)}</strong>
             </p>
             {lastTurn.client_eos_to_audible_ms !== undefined && (
               <p className="sarang-diag-lead">
                 In this browser, speech end → audible:{" "}
                 <strong>{formatMs(lastTurn.client_eos_to_audible_ms)}</strong>
-                {lastTurn.eos_to_answer_audio_ms !== undefined && (
+                {lastTurn.eos_to_first_audio_ms !== undefined && (
                   <>
                     {" · "}network + playback:{" "}
                     <strong>
                       {formatMs(
                         lastTurn.client_eos_to_audible_ms -
-                          lastTurn.eos_to_answer_audio_ms,
+                          lastTurn.eos_to_first_audio_ms,
                       )}
                     </strong>
                   </>

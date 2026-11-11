@@ -122,7 +122,12 @@ process after rebuilding.
 - `/api/config` — public, credential-free configuration.
 - `/api/metrics` — rolling stage distributions, tool calls, speculation adoption.
 - Diagnostics drawer - last turn's `eos_to_answer_audio_ms` (the honest number),
-  `eos_to_first_audio_ms` (may include a filler), transport, ICE candidate type.
+  `eos_to_first_audio_ms` (includes egress, and any filler), transport, ICE
+  candidate type. The two differ by `egress` on a turn without a filler: the
+  first is stamped when the answer's first chunk reaches the egress queue, the
+  second when a frame actually leaves the process. Neither is wrong; they answer
+  different questions, and "network + playback" is subtracted from the second
+  because that is the moment the browser can begin to hear anything.
 
 ### Measuring the visitor's own number
 
@@ -134,7 +139,9 @@ reports both sides, and the difference between them is that leg:
   saw the server leave `user_speaking`, and when its `AudioContext` scheduled the
   first answer buffer to be *heard*. Both are on `performance.now()`, so no clock
   sync is involved and a stalled tab cannot shift the answer.
-- **network + playback** — the difference from `eos_to_answer_audio_ms`.
+- **network + playback** — the difference from `eos_to_first_audio_ms`, the
+  moment a frame left the gateway. Using `eos_to_answer_audio_ms` here would
+  fold `egress` into a leg that is supposed to be pure network and playback.
 
 A headless browser cannot be granted a microphone, so this needs a real one:
 
