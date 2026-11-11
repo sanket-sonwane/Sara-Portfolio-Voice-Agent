@@ -76,6 +76,21 @@ class TurnMarks:
     def mark_end_of_speech(self) -> None:
         self.end_of_speech = now()
 
+    def mark_endpoint(self, duration_ms: float) -> None:
+        """Record the silence window observed before the turn was declared over.
+
+        Endpointing finishes *before* this marks object exists - the turn
+        engine only sees the text after ``transcript.final`` - so the stage is
+        written back-dated: it opened ``duration_ms`` before the origin and
+        closed at the origin. Without it the largest single term in the
+        latency budget (the configured silence window, as actually observed on
+        the wire) is invisible in ``/api/metrics``.
+        """
+        if duration_ms <= 0:
+            return
+        self.stage_enter["endpoint"] = self.origin - duration_ms / 1000.0
+        self.stage_exit["endpoint"] = self.origin
+
     def offsets(self) -> dict[str, float]:
         return {
             stage: round((stamp - self.origin) * 1000.0, 1)

@@ -95,6 +95,12 @@ class UtteranceLoop:
         self._ring_limit = max(3_200, settings.endpoint_preroll_ms * _BYTES_PER_MS)
         self._dump_dir = Path(settings.asr_dump_dir) if settings.asr_dump_dir else None
         self._final_timeout = settings.asr_final_timeout_s
+        # Media clock and the moment the closing silence window opened. The
+        # endpoint cost is measured in *media* time, not wall clock: a test (or
+        # a burst replay) pushes frames faster than real time, and a wall-clock
+        # difference would then report milliseconds for an 800 ms window.
+        self._media_ms = 0.0
+        self._silence_onset: float | None = None
 
     # ------------------------------------------------------------------ input
 
@@ -109,7 +115,23 @@ class UtteranceLoop:
         if not self._capturing:
             self._remember(frame)
 
+        frame_start = self._media_ms
+        self._media_ms += pcm.size / 16.0  # 16 samples per ms at 16 kHz
         update = self.vad.push(pcm, 16_000)
+
+        # When the closing silence window opened, in media time. The onset is
+        # stamped at the *start* of the first frame the VAD counts as silence,
+        # so the measured span equals the window the detector actually waited.
+        endpoint_ms = 0.0
+        if update.speech_ended:
+            if self._silence_onset is not None:
+                endpoint_ms = max(0.0, self._media_ms - self._silence_onset)
+            self._silence_onset = None
+        elif self._capturing and update.silence_ms > 0.0:
+            if self._silence_onset is None:
+                self._silence_onset = frame_start
+        elif self._capturing:
+            self._silence_onset = None
 
         started = False
         if update.speech_started and not self._capturing:
@@ -135,7 +157,7 @@ class UtteranceLoop:
 
         if update.speech_ended and self._capturing:
             self._capturing = False
-            self._start_finalize()
+            self._start_finalize(endpoint_ms)
 
     def _remember(self, frame: bytes) -> None:
         self._ring.append(frame)
@@ -162,6 +184,7 @@ class UtteranceLoop:
                 self._finalizing = False
 
         session.set_state(SessionState.LISTENING, "Listening")
+        self._silence_onset = None
 
         if not await self._ensure_asr():
             return
@@ -274,17 +297,18 @@ class UtteranceLoop:
 
     # --------------------------------------------------------------- finalize
 
-    def _start_finalize(self) -> None:
+    def _start_finalize(self, endpoint_ms: float = 0.0) -> None:
         if self._finalizing:
             return
         self._finalizing = True
-        self._final_task = asyncio.create_task(self._finalize())
+        self._final_task = asyncio.create_task(self._finalize(endpoint_ms))
 
-    async def _finalize(self) -> None:
+    async def _finalize(self, endpoint_ms: float = 0.0) -> None:
         session = self.session
         utterance = self.current
         marks = TurnMarks("pending")
         marks.mark_end_of_speech()
+        marks.mark_endpoint(endpoint_ms)
         marks.source = "voice"
         session.set_state(SessionState.TRANSCRIBING, "Transcribing")
         try:

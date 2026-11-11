@@ -190,3 +190,44 @@ async def test_partial_is_only_used_when_the_final_never_arrives(
         assert asr.finalizes == 1
     finally:
         await loop.close()
+
+
+async def test_endpoint_window_is_recorded_in_media_time(engine, fake_asr, monkeypatch):
+    """The observed silence window lands on the turn as the ``endpoint`` stage.
+
+    Frames here are pushed in a burst, far faster than real time: the stage
+    must still report the media-time window the detector actually waited
+    (800 ms), not the wall-clock microseconds the burst took.
+    """
+    captured: dict = {}
+
+    async def run_turn(session, text, **kwargs):
+        captured["marks"] = kwargs.get("marks")
+
+    monkeypatch.setattr(engine, "run_turn", run_turn)
+
+    session = engine.create_session("test")
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+        for _ in range(60):
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        marks = captured.get("marks")
+        assert marks is not None
+        endpoint = marks.durations().get("endpoint")
+        assert endpoint is not None
+        assert round(endpoint) == 800
+        # The stage is visible to the metrics store the diagnostics panel reads.
+        assert "endpoint" in marks.to_payload()["durations_ms"]
+    finally:
+        await loop.close()

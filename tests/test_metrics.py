@@ -46,3 +46,28 @@ def test_percentile_matches_nearest_rank_expectations():
     assert percentile([], 50) == 0.0
     assert percentile([7.0], 95) == 7.0
     assert percentile([1.0, 2.0, 3.0], 50) == 2.0
+
+
+def test_mark_endpoint_backdates_the_silence_window():
+    """Endpointing finishes before the marks object exists; the stage is written back.
+
+    Without this the configured silence window - the single biggest term in
+    the budget - never appears in /api/metrics, and every later claim about
+    endpointing is inferred from config instead of measured.
+    """
+    marks = TurnMarks("trn_1")
+
+    marks.mark_endpoint(812.0)
+
+    assert round(marks.durations()["endpoint"], 1) == 812.0
+    # The stage closes where the turn begins: origin is speech end.
+    assert marks.stage_exit["endpoint"] == marks.origin
+
+
+def test_mark_endpoint_ignores_a_missing_window():
+    """No observed window (e.g. a typed turn) must not invent a stage."""
+    marks = TurnMarks("trn_1")
+
+    marks.mark_endpoint(0.0)
+
+    assert marks.durations() == {}
