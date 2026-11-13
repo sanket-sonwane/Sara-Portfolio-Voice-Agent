@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from sarang.metrics import TurnMarks, percentile
+from sarang.metrics import MetricsStore, TurnMarks, percentile
 
 
 def test_exit_open_closes_a_stage_that_was_entered():
@@ -130,3 +130,71 @@ def test_transport_first_frame_is_not_reported_without_an_egress_frame():
     assert payload["transport_first_frame_ms"] == 0.0
     assert "egress_first_frame_ms" not in payload
     assert "first_audio_ms" not in payload
+
+
+def test_client_deltas_are_added_to_the_server_axis():
+    """The browser cannot share the server clock, so it reports deltas.
+
+    Adding them to ``end_of_speech -> transport_first_frame`` puts the number
+    the visitor experienced on the one axis a report should read, without
+    pretending the two clocks are the same.
+    """
+    marks = TurnMarks("trn_1", origin=100.0)
+    marks.mark_end_of_speech(100.0)
+    marks.mark_transport_first_frame()
+    marks.transport_first_frame = 100.9  # 900 ms after the last speech frame
+    marks.client_scheduled_ms = 40.0
+    marks.client_audible_ms = 85.0
+
+    payload = marks.to_payload()
+
+    assert payload["eos_to_transport_first_frame_ms"] == 900.0
+    assert payload["client_scheduled_ms"] == 40.0
+    assert payload["eos_to_client_scheduled_ms"] == 940.0
+    assert payload["client_audible_ms"] == 85.0
+    assert payload["eos_to_client_audible_ms"] == 985.0
+
+
+def test_client_deltas_without_a_transport_stamp_are_not_summed():
+    """No server anchor means no combined number; the delta is still recorded."""
+    marks = TurnMarks("trn_1", origin=100.0)
+    marks.client_audible_ms = 50.0
+
+    payload = marks.to_payload()
+
+    assert payload["client_audible_ms"] == 50.0
+    assert "eos_to_client_audible_ms" not in payload
+    assert "eos_to_client_scheduled_ms" not in payload
+
+
+def test_degraded_is_only_reported_when_the_turn_was_distorted():
+    assert "degraded" not in TurnMarks("trn_clean").to_payload()
+
+    marks = TurnMarks("trn_cut")
+    marks.degraded = "llm_midstream"
+    assert marks.to_payload()["degraded"] == "llm_midstream"
+
+
+def test_observe_client_keeps_the_late_report_with_its_turn():
+    """The audible report arrives after ``metrics.turn``; it must land there."""
+    store = MetricsStore(capacity=10)
+    marks = TurnMarks("trn_1", origin=100.0)
+    marks.mark_end_of_speech(100.0)
+    marks.mark_transport_first_frame()
+    marks.transport_first_frame = 100.8
+    store.record(marks)
+
+    store.observe_client(
+        {
+            "turn_id": "trn_1",
+            "eos_to_client_scheduled_ms": 830.0,
+            "eos_to_client_audible_ms": 872.0,
+            "audible_chars": 42,
+        }
+    )
+
+    assert list(store.samples["client_scheduled"]) == [830.0]
+    assert list(store.samples["client_audible"]) == [872.0]
+    assert store.turns[-1]["audible_chars"] == 42
+    assert store.turns[-1]["eos_to_client_audible_ms"] == 872.0
+

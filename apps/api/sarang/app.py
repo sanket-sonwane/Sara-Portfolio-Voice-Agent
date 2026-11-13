@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import struct
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -72,6 +74,10 @@ def _config_payload(settings: Settings) -> dict[str, Any]:
         "states": [state.value for state in ALL_STATES],
         "broadcast_sample_rate": 48_000,
         "input_sample_rate": 16_000,
+        # PCM frames on /ws/audio are prefixed with (generation, sequence).
+        # A client that does not see this must not guess: it reloads rather
+        # than play a header as audio.
+        "audio_format": "pcm16-v2",
         # Whether WebRTC is actually offered, not merely installed: the library
         # being present while ENABLE_WEBRTC is false used to report "webrtc:
         # true" and made the client attempt an ICE negotiation that cannot
@@ -163,11 +169,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def start_text_turn(session: Session, text: str) -> str:
         cleaned = " ".join(text.split())
-        if session.state.value in {"speaking", "thinking", "tool_working", "transcribing"}:
+        # A typed question supersedes everything the previous input started,
+        # including a voice turn that is still waiting for its ASR final.
+        session.input_seq += 1
+        input_seq = session.input_seq
+        if session.state.value in {
+            "speaking",
+            "thinking",
+            "tool_working",
+            "transcribing",
+            "user_speaking",
+        }:
             await orchestrator.interrupt(session, "new-text-turn")
+        else:
+            # Even in a quiet state, a pending finalizer must be abandoned:
+            # otherwise it can deliver a transcript after this turn began.
+            voice = session.voice
+            abandon = getattr(voice, "abandon_pending", None)
+            if abandon is not None:
+                abandon()
         turn_id = new_turn_id()
         task = asyncio.create_task(
-            orchestrator.run_turn(session, cleaned, source="text", turn_id=turn_id)
+            orchestrator.run_turn(
+                session,
+                cleaned,
+                source="text",
+                turn_id=turn_id,
+                input_seq=input_seq,
+            )
         )
         session.turn_task = task
         return turn_id
@@ -294,7 +323,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         await websocket.accept()
         session.ever_connected = True
-        key, queue = bus.subscribe()
+        key, queue = bus.subscribe(session.id)
         if session.state == SessionState.IDLE:
             session.set_state(SessionState.READY)
 
@@ -330,6 +359,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 )
                 elif kind == "interrupt":
                     await orchestrator.interrupt(session, str(message.get("reason", "client")))
+                elif kind == "audible":
+                    # The browser's own account of what it actually played. It
+                    # is never inferred from the fact that a frame was sent.
+                    orchestrator.note_audible(
+                        session,
+                        str(message.get("turn_id", "")),
+                        chars=message.get("chars"),
+                        text=message.get("text"),
+                    )
                 elif kind == "mute":
                     session.muted = bool(message.get("muted", False))
                     session.set_state(session.state)
@@ -350,6 +388,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except TimeoutError:
                     with contextlib.suppress(Exception):
                         await websocket.send_json({"type": "ping"})
+                    continue
+                # Defence in depth: the bus is already session-scoped, but a
+                # mis-stamped envelope must never cross a session boundary.
+                if event.session_id != session.id:
+                    log.warning(
+                        "dropping cross-session event %s for %s (belongs to %s)",
+                        event.type,
+                        session.id,
+                        event.session_id,
+                    )
                     continue
                 with contextlib.suppress(Exception):
                     await websocket.send_json(event.to_wire())
@@ -387,19 +435,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             StreamResampler(input_rate, 16_000) if input_rate != 16_000 else None
         )
         if session.voice is not None:
+            # Close before installing the replacement. The old order installed
+            # the new loop and then closed the old one, so a reconnect could
+            # leave `session.voice` pointing at a closed loop.
+            previous, session.voice = session.voice, None
             with contextlib.suppress(Exception):
-                await session.voice.close()
+                await previous.close()
         loop = UtteranceLoop(orchestrator, session)
         session.voice = loop
-        asyncio.create_task(loop.warm())
+        # Retained so the connection can cancel it. A detached warm-up that
+        # finished after close used to install an ASR reader into a dead loop.
+        warm_task = asyncio.create_task(loop.warm())
         if not session.welcome_sent:
             asyncio.create_task(orchestrator.greet(session))
 
         async def sender() -> None:
             while not session.closed:
-                generation = session.generation
                 frame = await session.egress.next_frame()
-                await websocket.send_bytes(frame_bytes(frame))
+                generation = int(frame.generation)
+                if generation != session.generation:
+                    # Selected before an interrupt. Writing it now would put the
+                    # old generation on the wire after EPOCH.
+                    continue
+                await websocket.send_bytes(
+                    struct.pack("<II", generation, int(frame.sequence)) + frame_bytes(frame)
+                )
+                session.egress.ack_transport(generation, int(frame.sequence))
                 marks = session.marks.get(generation)
                 if (
                     marks is not None
@@ -429,18 +490,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
                 text = message.get("text")
                 if text:
-                    if "interrupt" in text:
+                    # Control messages are JSON. Parsing beats substring tests:
+                    # a transcript or a stray word must never be read as a
+                    # command, and the audible report needs typed fields.
+                    try:
+                        control = json.loads(text)
+                    except (TypeError, ValueError):
+                        control = None
+                    kind = str(control.get("type", "")) if isinstance(control, dict) else ""
+                    if kind == "interrupt":
                         await orchestrator.interrupt(session, "client")
-                    elif "end" in text:
+                    elif kind == "end":
                         break
+                    elif kind == "audible" and isinstance(control, dict):
+                        orchestrator.note_audible(
+                            session,
+                            str(control.get("turn_id", "")),
+                            chars=control.get("chars"),
+                            text=control.get("text"),
+                            scheduled_ms=control.get("scheduled_ms"),
+                            audible_ms=control.get("audible_ms"),
+                        )
         except WebSocketDisconnect:
             pass
         finally:
+            warm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await warm_task
             send_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await send_task
             await loop.close()
-            session.voice = None
+            # Only the connection that still owns the slot may clear it. An old
+            # socket closing after a reconnect must not erase the new loop.
+            if session.voice is loop:
+                session.voice = None
 
     # ------------------------------------------------------------------ static
 

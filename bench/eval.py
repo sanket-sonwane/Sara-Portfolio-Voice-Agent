@@ -266,6 +266,19 @@ def _percentile(values: list[float], fraction: float) -> float:
     return round(ordered[index], 1)
 
 
+def _collect(records: list[dict], key: str) -> list[float]:
+    values = [float(record["metrics"].get(key) or 0.0) for record in records]
+    return [value for value in values if value > 0]
+
+
+def _latency(values: list[float]) -> dict[str, float]:
+    return {
+        "p50": _percentile(values, 0.5),
+        "p90": _percentile(values, 0.9),
+        "p95": _percentile(values, 0.95),
+    }
+
+
 def summarise(records: list[dict]) -> dict:
     passed = [record for record in records if record["passed"]]
     by_group: dict[str, dict[str, int]] = {}
@@ -273,10 +286,6 @@ def summarise(records: list[dict]) -> dict:
         bucket = by_group.setdefault(record["group"], {"passed": 0, "total": 0})
         bucket["total"] += 1
         bucket["passed"] += int(record["passed"])
-    audio = [
-        float(record["metrics"].get("answer_first_audio_ms") or 0.0) for record in records
-    ]
-    audio = [value for value in audio if value > 0]
     return {
         "total": len(records),
         "passed": len(passed),
@@ -286,12 +295,29 @@ def summarise(records: list[dict]) -> dict:
             for group, counts in sorted(by_group.items())
         },
         "latency_ms": {
-            "answer_first_audio_p50": _percentile(audio, 0.5),
-            "answer_first_audio_p95": _percentile(audio, 0.95),
+            # Primary: last speech frame -> the first answer frame actually
+            # written to the wire. Text turns have no browser leg.
+            "eos_to_transport_first_frame": _latency(
+                _collect(records, "eos_to_transport_first_frame_ms")
+            ),
+            # Browser-confirmed, when a client sent the audible report. Absent
+            # for the HTTP bench, which has no playback device.
+            "eos_to_client_audible": _latency(
+                _collect(records, "eos_to_client_audible_ms")
+            ),
+            # Provider output, kept for comparison and labelled as such: this
+            # is when the first synthesized span arrived, not when the visitor
+            # heard anything.
+            "answer_first_audio_provider_output": _latency(
+                _collect(records, "answer_first_audio_ms")
+            ),
             "llm_ttft_median": round(
                 statistics.median(
                     [
-                        float(record["metrics"].get("durations_ms", {}).get("llm_ttft", 0) or 0)
+                        float(
+                            record["metrics"].get("durations_ms", {}).get("llm_ttft", 0)
+                            or 0
+                        )
                         for record in records
                     ]
                 ),
@@ -299,6 +325,9 @@ def summarise(records: list[dict]) -> dict:
             )
             if records
             else 0.0,
+            "degraded_turns": sum(
+                1 for record in records if record["metrics"].get("degraded")
+            ),
         },
     }
 
@@ -362,11 +391,24 @@ async def main_async(args: argparse.Namespace) -> int:
                     print(f"         -> {', '.join(reasons)}")
 
     summary = summarise(records)
+    primary = summary["latency_ms"]["eos_to_transport_first_frame"]
+    confirmed = summary["latency_ms"]["eos_to_client_audible"]
+    provider = summary["latency_ms"]["answer_first_audio_provider_output"]
     print(
         f"\n{summary['passed']}/{summary['total']} passed "
         f"({summary['pass_rate'] * 100:.1f}%) | "
-        f"answer audio p50 {summary['latency_ms']['answer_first_audio_p50']:.0f} ms, "
-        f"p95 {summary['latency_ms']['answer_first_audio_p95']:.0f} ms"
+        f"EOS→wire p50 {primary['p50']:.0f} ms, p90 {primary['p90']:.0f}, "
+        f"p95 {primary['p95']:.0f}"
+    )
+    if confirmed["p50"]:
+        print(
+            f"  browser-confirmed EOS→audible p50 {confirmed['p50']:.0f} ms, "
+            f"p90 {confirmed['p90']:.0f}, p95 {confirmed['p95']:.0f}"
+        )
+    print(
+        f"  provider first audio (output, not audible) p50 {provider['p50']:.0f} ms, "
+        f"p95 {provider['p95']:.0f} | degraded turns "
+        f"{summary['latency_ms']['degraded_turns']}"
     )
     for group, counts in summary["by_group"].items():
         print(f"  {group:<14} {counts['passed']}/{counts['total']} ({counts['rate'] * 100:.0f}%)")

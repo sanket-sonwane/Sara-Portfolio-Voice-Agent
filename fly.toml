@@ -23,15 +23,22 @@ kill_timeout = 5
   # Pinned here rather than in a secret so the deployed TTS arm is reviewable in
   # the repository. ADR 0004 selects Smallest Lightning over Cartesia.
   TTS_PROVIDER = "smallest"
+  # English release configuration. Code-switching is exercised explicitly in
+  # tests and can be turned back on with SMALLEST_LANGUAGE=hi.
+  SMALLEST_LANGUAGE = "en"
   # WebRTC needs a TURN server to work behind Fly's private networking; with
   # STUN only, every visitor pays a failed ICE before falling back to the
   # WebSocket PCM path. Until TURN exists, go straight to the transport that
   # actually connects. Flip back to "true" once TURN_SHARED_SECRET is set.
   ENABLE_WEBRTC = "false"
   ALLOWED_ORIGINS = "https://sanket--sonwane.vercel.app"
-  # 800 ms of silence ends a turn. 500 ms closed turns mid-sentence on Indian
-  # accented speech; the pre-roll buffer makes the extra wait invisible.
-  ENDPOINT_SILENCE_MS = "800"
+  # 500 ms of silence ends a turn. This is the measured safe floor: the fixture
+  # with the longest internal pause (460 ms, bench/audio/question-16k.wav) did
+  # not split across 5/5 turns, and every transcript matched the 800 ms run.
+  # The pre-roll buffer covers the speech that triggered the detector, so the
+  # window is not what protects the first word. Raise it if real traffic shows
+  # mid-sentence splits; the 800 ms numbers are in docs/voice-pipeline-fixes.md.
+  ENDPOINT_SILENCE_MS = "500"
   LOG_LEVEL = "info"
 
 [http_service]

@@ -74,6 +74,16 @@ class StreamResampler:
         return to_int16(converted)
 
 
+    def flush(self) -> np.ndarray:
+        """Return the samples still held in the resampler's filter delay."""
+        if self.src_rate == self.dst_rate or self._stream is None:
+            return np.zeros(0, dtype=np.int16)
+        converted = self._stream.resample_chunk(
+            np.zeros(0, dtype=np.float32), last=True
+        )
+        return to_int16(converted)
+
+
 def resample_array(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     if src_rate == dst_rate:
         return samples.astype(np.int16)

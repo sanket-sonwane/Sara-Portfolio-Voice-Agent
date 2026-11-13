@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sarang.kb.lookup import lookup, strip_discourse, tokenize
+from sarang.kb.lookup import is_followup, lookup, strip_discourse, tokenize
 
 
 def test_cgpa_routes_to_education():
@@ -151,3 +151,54 @@ def test_intent_survives_the_strip():
     """The strip runs before routing; intent patterns match on content words."""
     assert lookup(strip_discourse("well however what is his salary")).blocked
     assert lookup(strip_discourse("i mean like what did he do at arai")).top is not None
+
+
+# ---------------------------------------------------------------- follow-ups
+# A continuation is only a continuation when the question has no subject of its
+# own. These cases come from the transcript that prompted the split: pronouns
+# and "the numbers" refer back, "what about QA-Forge" does not, and "this
+# system" must not be lost just because the router scored "system" somewhere.
+
+
+def test_a_pronoun_continuation_carries_the_previous_evidence():
+    previous = lookup("What did he do at ARAI?")
+    current = lookup("How does this system work?")
+    assert is_followup("How does this system work?", previous, current)
+
+
+def test_a_bare_number_question_refers_back():
+    previous = lookup("What did he do at ARAI?")
+    current = lookup("The numbers?")
+    assert is_followup("The numbers?", previous, current)
+
+
+def test_a_subject_inside_a_follow_up_shape_keeps_its_own_evidence():
+    """"what about" introduces a subject; the router already found that one."""
+    previous = lookup("What did he do at ARAI?")
+    current = lookup("What about QA-Forge?")
+    assert current.confident and current.top is not None
+    assert current.top.id == "project:qa-forge"
+    assert not is_followup("What about QA-Forge?", previous, current)
+
+
+def test_a_follow_up_phrase_about_the_same_block_still_merges():
+    previous = lookup("What did he do at ARAI?")
+    current = lookup("What about this at ARAI?")
+    assert is_followup("What about this at ARAI?", previous, current)
+
+
+def test_tell_me_more_is_a_follow_up_even_when_the_router_scores_something():
+    previous = lookup("What did he do at ARAI?")
+    current = lookup("Tell me more about that internship.")
+    assert is_followup("Tell me more about that internship.", previous, current)
+
+
+def test_a_named_new_question_is_not_a_follow_up():
+    previous = lookup("What did he do at ARAI?")
+    assert not is_followup("Tell me about TattvaQuest", previous, lookup("Tell me about TattvaQuest"))
+    assert not is_followup("What did he build at ARAI?", previous, lookup("What did he build at ARAI?"))
+
+
+def test_no_previous_evidence_means_no_follow_up_to_merge():
+    current = lookup("The numbers?")
+    assert not is_followup("The numbers?", None, current)

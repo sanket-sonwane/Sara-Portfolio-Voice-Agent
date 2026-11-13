@@ -218,11 +218,22 @@ export class Playback {
   private readonly resampler: LinearResampler;
   private playhead = 0;
   private closed = false;
+  // Wire-level audio identity. A frame that belongs to a generation older than
+  // the one already playing, or that arrives out of order, is discarded before
+  // it can touch the playhead: after a barge-in the socket can still deliver
+  // packets the server selected before it saw the EPOCH.
+  private generation = -1;
+  private lastSequence = -1;
   // When the audio scheduled in the current run first becomes audible, on the
   // performance.now() clock. Null until something is scheduled, and cleared when
   // the run is flushed. This is the only honest answer to "when did the visitor
   // hear it": a buffer that has been enqueued has not been heard yet.
   private audibleAt: number | null = null;
+  // The AudioContext time at which that first buffer starts. Needed to read
+  // the device clock back: getOutputTimestamp() reports where the output is,
+  // not where the graph is.
+  private runStartContext: number | null = null;
+  private runEndContext: number | null = null;
 
   constructor() {
     const AudioContextClass = audioContextConstructor();
@@ -269,8 +280,39 @@ export class Playback {
     return this.audibleAt;
   }
 
-  enqueue(pcm: Int16Array): void {
+  /**
+   * `performance.now()` at which the output device actually reached the first
+   * scheduled sample, or null while that moment has not happened yet.
+   *
+   * `audibleFrom` is a prediction made when the buffer is scheduled. This is
+   * the observation: `AudioContext.getOutputTimestamp()` says which point in
+   * the context timeline the speakers are at, and when. Reporting the
+   * prediction as "audible" is how a latency number gets flattered by the
+   * audio thread's own backlog.
+   */
+  audibleConfirmedFrom(): number | null {
+    if (this.audibleAt === null || this.runStartContext === null) return null;
+    const timestamp = this.context.getOutputTimestamp?.();
+    if (
+      !timestamp ||
+      typeof timestamp.contextTime !== "number" ||
+      typeof timestamp.performanceTime !== "number"
+    ) {
+      return null;
+    }
+    if (timestamp.contextTime + 0.005 < this.runStartContext) return null;
+    return timestamp.performanceTime + (this.runStartContext - timestamp.contextTime) * 1000;
+  }
+
+  enqueue(pcm: Int16Array, generation = this.generation, sequence = this.lastSequence + 1): void {
     if (this.closed || !pcm.length) return;
+    if (generation < this.generation) return;
+    if (generation > this.generation) {
+      this.generation = generation;
+      this.lastSequence = -1;
+    }
+    if (sequence <= this.lastSequence) return;
+    this.lastSequence = sequence;
     let samples = int16ToFloat(pcm);
     if (this.context.sampleRate !== TRACK_RATE) {
       samples = this.resampler.process(samples);
@@ -294,11 +336,29 @@ export class Playback {
       // first buffer from being clipped.
       this.playhead = now + 0.025;
       this.audibleAt = performance.now() + (this.playhead - now) * 1000;
+      this.runStartContext = this.playhead;
     }
     source.start(this.playhead);
     this.playhead += buffer.duration;
+    this.runEndContext = this.playhead;
     this.sources.add(source);
     source.onended = () => this.sources.delete(source);
+  }
+
+  /**
+   * Fraction (0..1) of the current run that the output clock has passed.
+   *
+   * Used only to estimate how much of the answer's text was audible. It is
+   * deliberately labelled an estimate: without word alignment there is no
+   * honest character boundary, and the server records `audible_text` from the
+   * character count this produces, never from the fact that audio was sent.
+   */
+  progress(): number {
+    if (this.runStartContext === null || this.runEndContext === null) return 0;
+    const total = this.runEndContext - this.runStartContext;
+    if (total <= 0) return 0;
+    const played = this.context.currentTime - this.runStartContext;
+    return Math.max(0, Math.min(1, played / total));
   }
 
   /** Stop everything already scheduled and duck output for the flush guard. */
@@ -314,6 +374,8 @@ export class Playback {
     this.sources.clear();
     this.playhead = 0;
     this.audibleAt = null;
+    this.runStartContext = null;
+    this.runEndContext = null;
     const now = this.context.currentTime;
     const gain = this.gain.gain;
     gain.cancelScheduledValues(now);
@@ -371,7 +433,7 @@ export interface PcmSocketHandlers {
   onOpen?: () => void;
   onClose?: (event: CloseEvent) => void;
   onError?: (error: Event) => void;
-  onAudio: (pcm: Int16Array) => void;
+  onAudio: (pcm: Int16Array, generation: number, sequence: number) => void;
   /** Called when the send queue is over the real-time budget and frames are dropped. */
   onOverload?: (queuedMs: number, droppedMs: number) => void;
 }
@@ -431,7 +493,13 @@ export class PcmSocket {
       socket.onmessage = (event) => {
         if (typeof event.data === "string") return;
         if (event.data instanceof ArrayBuffer) {
-          this.handlers.onAudio(new Int16Array(event.data));
+          // pcm16-v2: u32 generation, u32 sequence, then little-endian PCM.
+          // A frame shorter than the header is malformed, not audio.
+          if (event.data.byteLength < 8) return;
+          const header = new DataView(event.data);
+          const generation = header.getUint32(0, true);
+          const sequence = header.getUint32(4, true);
+          this.handlers.onAudio(new Int16Array(event.data, 8), generation, sequence);
         }
       };
       socket.onerror = (event) => {
@@ -459,6 +527,22 @@ export class PcmSocket {
       return;
     }
     socket.send(pcm.buffer);
+  }
+
+  /**
+   * Send a JSON control message (interrupt, audible report).
+   *
+   * Control is a separate frame type, so it never competes for the audio
+   * budget and is never mistaken for PCM by the gateway.
+   */
+  sendControl(message: Record<string, unknown>): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify(message));
+    } catch {
+      // A closing socket loses the report, not the conversation.
+    }
   }
 
   close(): void {

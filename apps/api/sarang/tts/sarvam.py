@@ -66,7 +66,6 @@ class SarvamTTS(TTS):
         self.language = language
         self.sample_rate = sample_rate
         self.timeout = timeout
-        self._resampler = StreamResampler(sample_rate, 48_000)
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -124,9 +123,13 @@ class SarvamTTS(TTS):
             raise TTSError("sarvam tts returned no audio")
         for encoded in audios:
             samples, rate = _decode_audio(encoded)
-            if rate != self.sample_rate:
-                self._resampler = StreamResampler(rate, 48_000)
-            converted = self._resampler.process(samples)
+            # One resampler per audio blob. A stateful filter shared across
+            # concurrent segments mixes their histories and is not a stream.
+            resampler = StreamResampler(rate, 48_000)
+            converted = resampler.process(samples)
+            tail = resampler.flush()
+            if tail.size:
+                converted = np.concatenate([converted, tail])
             if converted.size:
                 # Yield in ~40 ms spans so the shaper can start early and a
                 # cancellation never waits for a whole paragraph of audio.

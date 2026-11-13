@@ -62,6 +62,14 @@ class _Utterance:
     index: int
     latest: str = ""
     final: str = ""
+    # Provider text before normalisation, kept so a diagnostic can show what
+    # the recogniser actually returned.
+    raw_latest: str = ""
+    raw_final: str = ""
+    # Audio the ASR adapter dropped because its outbox overflowed. Counted as
+    # a delta from begin_utterance so one turn is not charged for another's.
+    dropped_baseline: float = 0.0
+    dropped_ms: float = 0.0
     event: asyncio.Event = field(default_factory=asyncio.Event)
     pcm: bytearray = field(default_factory=bytearray)
     # The index the provider used for this turn, once one of its events has
@@ -115,6 +123,9 @@ class UtteranceLoop:
         # lookup inside the reader delayed ``transcript.final`` by up to 500 ms.
         self._note_text: str | None = None
         self._note_task: asyncio.Task | None = None
+        # Warm-up is owned, not detached: a connection that closes while the
+        # handshake is in flight must be able to cancel it.
+        self._warm_task: asyncio.Task | None = None
         # Pre-roll: only collected while no utterance is being captured, so it
         # holds the most recent 800 ms of silence and the first syllable of the
         # next question. It is replayed once, then cleared.
@@ -246,16 +257,22 @@ class UtteranceLoop:
         session.set_state(SessionState.USER_SPEAKING, "Hearing you")
         self._silence_onset = None
 
-        if not await self._ensure_asr():
-            # Without a reset the detector stays ``active`` and cannot emit
-            # ``speech_started`` again, so the rest of this utterance (and the
-            # next one, if the visitor keeps talking) would be ignored.
+        # Never wait for the ASR lock inside the microphone path: the handshake
+        # can take hundreds of milliseconds, and every one of them is audio the
+        # recogniser is not receiving. If the adapter is not ready, abandon this
+        # onset and let the detector fire again once warm-up lands.
+        if self.asr is None or not getattr(self.asr, "alive", True):
+            self._kick_warm()
+            log.warning("asr not ready; abandoning utterance onset")
             self.vad.reset()
             session.set_state(SessionState.LISTENING, "Listening")
             return
 
         self._utterance += 1
-        utterance = _Utterance(index=self._utterance)
+        utterance = _Utterance(
+            index=self._utterance,
+            dropped_baseline=self._asr_dropped_ms(),
+        )
         self.current = utterance
         self._open.append(utterance)
         # Provisional: Sarvam's counter is zero-based *in the dumps we have*,
@@ -303,6 +320,15 @@ class UtteranceLoop:
             return
         with contextlib.suppress(Exception):
             await self._ensure_asr()
+        # The loop may have closed while the handshake was in flight. An
+        # adapter installed after close would start a reader for a session that
+        # no longer exists.
+        if self.closed:
+            await self._close_asr()
+
+    def _kick_warm(self) -> None:
+        if self._warm_task is None or self._warm_task.done():
+            self._warm_task = asyncio.create_task(self.warm())
 
     async def _ensure_asr(self) -> bool:
         async with self._asr_lock:
@@ -342,6 +368,12 @@ class UtteranceLoop:
                 return False
 
         self.asr = asr
+        if self.closed:
+            # The connection closed during the handshake. Do not start a reader.
+            with contextlib.suppress(Exception):
+                await asr.close()
+            self.asr = None
+            return False
         self.reader = asyncio.create_task(self._read_asr())
         return True
 
@@ -431,10 +463,12 @@ class UtteranceLoop:
                 if utterance is None:
                     continue
                 if event.final:
+                    utterance.raw_final = event.text
                     utterance.final = normalize_transcript(event.text)
                     utterance.event.set()
                     # Keep reading: one socket serves the whole conversation.
                     continue
+                utterance.raw_latest = event.text
                 text = normalize_transcript(event.text)
                 if text != utterance.latest:
                     utterance.latest = text
@@ -476,6 +510,16 @@ class UtteranceLoop:
                 await self.asr.close()
             self.asr = None
 
+    def _asr_dropped_ms(self) -> float:
+        """Audio this adapter has dropped so far, in milliseconds.
+
+        Sarvam sheds the oldest queued audio when its outbox overflows. That
+        loss is real - the recogniser never heard it - and it used to be
+        invisible: the transcript looked complete while a word was missing.
+        """
+        value = getattr(self.asr, "dropped_ms", 0.0) if self.asr is not None else 0.0
+        return float(value or 0.0)
+
     # --------------------------------------------------------------- finalize
 
     def _abandon_finalize(self) -> None:
@@ -489,6 +533,24 @@ class UtteranceLoop:
         self._finalizing = False
         if task is not None and not task.done():
             task.cancel()
+
+    def abandon_pending(self, reason: str = "superseded") -> None:
+        """Synchronously give up any capture or finalization in flight.
+
+        Called from the input path (a typed question, a barge-in) where waiting
+        for the ASR final would let the old utterance start a second answer
+        after the new turn has already claimed the session.
+        """
+        if self.current is not None:
+            self.current.superseded = True
+        if self._finalizing:
+            self._abandon_finalize()
+        if self._capturing:
+            self._capturing = False
+            # Without a reset the detector stays ``active`` and cannot fire
+            # ``speech_started`` for the next question.
+            self.vad.reset()
+        log.debug("abandoned pending utterance: %s", reason)
 
     def _start_finalize(self, endpoint_ms: float = 0.0, origin: float | None = None) -> None:
         if self._finalizing:
@@ -544,14 +606,24 @@ class UtteranceLoop:
 
             text = (utterance.final or utterance.latest).strip()
             source = "final" if utterance.final else ("partial" if utterance.latest else "none")
-            if not utterance.final and text:
-                log.warning(
-                    "asr final timed out after %.1fs; using partial transcript (%d chars)",
-                    self._final_timeout,
-                    len(text),
-                )
+            utterance.dropped_ms = max(
+                0.0, self._asr_dropped_ms() - utterance.dropped_baseline
+            )
+            degraded = ""
+            if utterance.dropped_ms > 0:
+                degraded = "asr_audio_dropped"
+            elif source == "partial":
+                # The provider's final never arrived; the turn runs on a
+                # hypothesis that can still be wrong.
+                degraded = "asr_timeout"
+                if text:
+                    log.warning(
+                        "asr final timed out after %.1fs; using partial transcript (%d chars)",
+                        self._final_timeout,
+                        len(text),
+                    )
 
-            await self._dump(utterance, text, source, asr_final_ms)
+            await self._dump(utterance, text, source, asr_final_ms, degraded)
 
             if not text:
                 if self.current is utterance and session.state != SessionState.ERROR:
@@ -572,7 +644,13 @@ class UtteranceLoop:
 
             session.publish(
                 EventType.TRANSCRIPT_FINAL,
-                {"text": text, "source": "voice"},
+                {
+                    "text": text,
+                    "source": "voice",
+                    "degraded": degraded,
+                    "dropped_ms": round(utterance.dropped_ms, 1),
+                    "raw_text": utterance.raw_final or utterance.raw_latest,
+                },
             )
             task = asyncio.create_task(
                 self.orchestrator.run_turn(session, text, marks=marks, source="voice")
@@ -595,6 +673,7 @@ class UtteranceLoop:
         text: str,
         source: str,
         asr_final_ms: float | None,
+        degraded: str = "",
     ) -> None:
         if self._dump_dir is None or not utterance.pcm:
             return
@@ -607,6 +686,9 @@ class UtteranceLoop:
             "source": source,
             "partial": utterance.latest,
             "final": utterance.final,
+            "raw_text": utterance.raw_final or utterance.raw_latest,
+            "degraded": degraded,
+            "dropped_ms": round(utterance.dropped_ms, 1),
             "asr": getattr(self.asr, "server_config", {}) if self.asr else {},
             "asr_error": getattr(self.asr, "last_error", "") if self.asr else "",
             "asr_final_ms": round(asr_final_ms, 1) if asr_final_ms is not None else None,
@@ -639,6 +721,11 @@ class UtteranceLoop:
 
     async def close(self) -> None:
         self.closed = True
+        if self._warm_task is not None:
+            self._warm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._warm_task
+            self._warm_task = None
         if self._final_task is not None:
             self._final_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

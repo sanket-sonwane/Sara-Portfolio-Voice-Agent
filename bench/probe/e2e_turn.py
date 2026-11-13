@@ -38,6 +38,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -171,12 +172,27 @@ class AudioStream:
     def __init__(self) -> None:
         self.frames: list[tuple[float, bool]] = []
         self._task: asyncio.Task | None = None
+        # pcm16-v2: every binary frame is `u32 generation | u32 sequence |
+        # pcm16`. Parsing the header as samples would make every frame look
+        # voiced (the generation is non-zero), which is exactly the flattering
+        # measurement this probe exists to avoid.
+        self._generation = -1
+        self._sequence = -1
 
     async def run(self, ws) -> None:
         async for raw in ws:
             if isinstance(raw, str):
                 continue
-            samples = np.frombuffer(raw, dtype="<i2")
+            if len(raw) < 8:
+                continue
+            generation, sequence = struct.unpack_from("<II", raw, 0)
+            if generation < self._generation:
+                continue
+            if generation == self._generation and sequence <= self._sequence:
+                continue
+            self._generation = generation
+            self._sequence = sequence
+            samples = np.frombuffer(raw, dtype="<i2", offset=8)
             self.frames.append((now(), bool(samples.size and np.any(samples))))
 
     def last_voice(self) -> float | None:
@@ -348,6 +364,7 @@ def _totals(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "total": label,
                 "n": summary["n"],
                 "p50_ms": summary["p50"],
+                "p90_ms": summary["p90"],
                 "p95_ms": summary["p95"],
                 "max_ms": summary["max"],
             }
@@ -386,7 +403,7 @@ async def run(args: argparse.Namespace) -> int:
             print(
                 f"run {index + 1}/{args.runs}: "
                 f"client={run_result['client_total_ms']:.0f} ms "
-                f"eos_first={metrics.get('eos_to_first_audio_ms')} ms "
+                f"eos_wire={metrics.get('eos_to_transport_first_frame_ms')} ms "
                 f"eos_answer={metrics.get('eos_to_answer_audio_ms')} ms "
                 f"transcript={run_result['transcript']!r}"
             )
@@ -394,7 +411,7 @@ async def run(args: argparse.Namespace) -> int:
         total_rows = _totals(runs)
         stage_rows = _stage_rows(runs)
         print()
-        print(format_table(total_rows, ["total", "n", "p50_ms", "p95_ms", "max_ms"]))
+        print(format_table(total_rows, ["total", "n", "p50_ms", "p90_ms", "p95_ms", "max_ms"]))
         print()
         print(format_table(stage_rows, ["component", "n", "p50_ms", "p95_ms", "max_ms"]))
         print()

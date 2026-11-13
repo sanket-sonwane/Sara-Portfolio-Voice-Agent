@@ -56,6 +56,15 @@ class TurnMarks:
     tts_first_span: float | None = None
     answer_first_audio: float | None = None
     transport_first_frame: float | None = None
+    # Why this turn is not a clean sample: "llm_midstream", "tts_partial",
+    # "asr_audio_dropped", "asr_timeout". Empty means undistorted.
+    degraded: str = ""
+    # Browser-reported, measured from the first voiced frame it received:
+    # how long until that audio was scheduled, and until the output device
+    # confirmed it. Both are clock-independent deltas; the server adds its own
+    # end-of-speech -> transport stamp.
+    client_scheduled_ms: float | None = None
+    client_audible_ms: float | None = None
 
     def enter(self, stage: str) -> None:
         self.stage_enter[stage] = now()
@@ -143,6 +152,8 @@ class TurnMarks:
             "filler_used": self.filler_used,
             "source": self.source,
         }
+        if self.degraded:
+            payload["degraded"] = self.degraded
         if self.tts_first_span is not None:
             payload["tts_first_span_ms"] = round(
                 (self.tts_first_span - self.origin) * 1000.0, 1
@@ -181,6 +192,35 @@ class TurnMarks:
                 payload["eos_to_answer_audio_ms"] = round(
                     (self.answer_first_audio - self.end_of_speech) * 1000.0, 1
                 )
+        payload.update(self.client_payload())
+        return payload
+
+    def _eos_to_transport_ms(self) -> float | None:
+        if self.end_of_speech is None or self.transport_first_frame is None:
+            return None
+        return (self.transport_first_frame - self.end_of_speech) * 1000.0
+
+    def client_payload(self) -> dict:
+        """The browser-confirmed half of the measurement.
+
+        The browser cannot share the server's monotonic clock, so it reports
+        deltas measured from the first voiced frame it received. Adding the
+        server's ``end_of_speech -> transport_first_frame`` keeps the primary
+        number on the last-speech-frame axis without pretending the two clocks
+        are the same.
+        """
+        payload: dict[str, float] = {}
+        base = self._eos_to_transport_ms()
+        if self.client_scheduled_ms is not None:
+            scheduled = round(float(self.client_scheduled_ms), 1)
+            payload["client_scheduled_ms"] = scheduled
+            if base is not None:
+                payload["eos_to_client_scheduled_ms"] = round(base + scheduled, 1)
+        if self.client_audible_ms is not None:
+            audible = round(float(self.client_audible_ms), 1)
+            payload["client_audible_ms"] = audible
+            if base is not None:
+                payload["eos_to_client_audible_ms"] = round(base + audible, 1)
         return payload
 
     def mark_tts_first_span(self) -> None:
@@ -223,6 +263,8 @@ STAGE_ORDER = (
     "transport_first_frame",
     "tts_first_span",
     "answer_first_audio",
+    "client_scheduled",
+    "client_audible",
 )
 
 
@@ -252,6 +294,24 @@ class MetricsStore:
             self.samples["answer_first_audio"].append(float(answer_first_audio))
         self.turns.append(payload)
         return payload
+
+    def observe_client(self, payload: dict) -> None:
+        """Add a browser-confirmed sample that arrived after the turn closed."""
+        for key, stage in (
+            ("eos_to_client_scheduled_ms", "client_scheduled"),
+            ("eos_to_client_audible_ms", "client_audible"),
+        ):
+            value = payload.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                self.samples.setdefault(stage, deque(maxlen=self.capacity)).append(
+                    float(value)
+                )
+        # Keep the most recent turn's payload in step with the late report.
+        turn_id = payload.get("turn_id")
+        for index in range(len(self.turns) - 1, -1, -1):
+            if self.turns[index].get("turn_id") == turn_id:
+                self.turns[index].update(payload)
+                break
 
     def summary(self) -> dict:
         stages = {}

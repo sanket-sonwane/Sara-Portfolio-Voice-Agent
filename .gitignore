@@ -31,3 +31,6 @@ cache/
 # os
 .DS_Store
 Thumbs.db
+
+# archives / ad-hoc bundles
+*.zip

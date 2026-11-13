@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from sarang.llm.base import TextDelta
 from sarang.orchestrator import filler_voice_tag
 from sarang.schemas import Envelope
+from sarang.tts.base import AudioSpan, TTSPartialError
 
 
 def test_filler_cache_is_keyed_by_provider_and_voice():
@@ -308,3 +310,117 @@ async def test_cancelled_turn_releases_the_lock_before_provider_cleanup(
     async with session.turn_lock:
         pass
     assert loop.time() - started < 0.2
+
+
+# ------------------------------------------------------- turn ownership
+
+
+async def test_stale_text_input_cannot_start_a_turn(orchestrator, session):
+    from sarang.session import SessionState
+
+    session.set_state(SessionState.LISTENING)
+    session.input_seq = 7
+
+    await orchestrator.run_turn(session, "an older question", input_seq=6)
+
+    assert session.turn_counter == 0
+    assert session.active_turn == ""
+
+
+async def test_interrupt_abandons_a_pending_voice_finalizer(orchestrator, session):
+    from sarang.session import SessionState
+
+    class _Voice:
+        abandoned = False
+
+        def abandon_pending(self) -> None:
+            self.abandoned = True
+
+    voice = _Voice()
+    session.voice = voice
+    session.set_state(SessionState.USER_SPEAKING)
+
+    await orchestrator.interrupt(session, "typed question")
+
+    assert voice.abandoned is True
+    assert session.state is SessionState.INTERRUPTED
+
+
+# -------------------------------------------------- degraded turn endings
+
+
+class _MidStreamLLM:
+    """Streams a full first sentence, then drops mid-way through the second."""
+
+    name = "fake"
+
+    def __init__(self, spoken: str, unfinished: str = "It also") -> None:
+        self.spoken = spoken
+        self.unfinished = unfinished
+        self.calls = 0
+
+    async def stream(self, messages, *, tools=None, max_tokens=160, temperature=0.25):
+        self.calls += 1
+        yield TextDelta(text=f"{self.spoken} {self.unfinished}")
+        raise RuntimeError("provider dropped mid-answer")
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_llm_failure_after_speech_keeps_the_prefix_and_does_not_fall_back(
+    orchestrator, session
+):
+    """A second, unrelated answer must not be appended after the spoken prefix."""
+    spoken = "Sanket built TattvaQuest, a commerce gateway."
+    orchestrator.llm = _MidStreamLLM(spoken)
+    key, queue = orchestrator.registry.bus.subscribe()
+
+    await orchestrator.run_turn(session, "What did he build?")
+
+    events = await collect(queue, "metrics.turn")
+    final = [event for event in events if event.type.value == "assistant.final"][-1]
+    notices = [event for event in events if event.type.value == "notice"]
+    metrics = [event for event in events if event.type.value == "metrics.turn"][-1]
+
+    assert final.payload["text"] == spoken
+    assert final.payload["committed_text"] == spoken
+    assert final.payload["generated_text"] == f"{spoken} It also"
+    assert metrics.payload["degraded"] == "llm_midstream"
+    assert any("dropped mid-answer" in event.payload["message"] for event in notices)
+    # The local answerer never ran: its notice would be in the stream.
+    assert not any("fact base" in event.payload.get("message", "") for event in notices)
+
+
+class _PartialTTS:
+    """Emits audio for a segment, then stops without saying where it stopped."""
+
+    name = "partial"
+
+    async def synthesize(self, text, *, context_id, final=True, metadata=None):
+        yield AudioSpan(pcm=np.ones(480, dtype=np.int16))
+        raise TTSPartialError(text)
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_tts_partial_stops_the_turn_and_claims_only_a_cut_sentence(
+    orchestrator, session
+):
+    """Without alignment the spoken boundary is unknown: do not claim the rest."""
+    orchestrator.tts = _PartialTTS()
+    key, queue = orchestrator.registry.bus.subscribe()
+
+    await orchestrator.run_turn(session, "What did he build?")
+
+    events = await collect(queue, "metrics.turn")
+    final = [event for event in events if event.type.value == "assistant.final"][-1]
+    metrics = [event for event in events if event.type.value == "metrics.turn"][-1]
+
+    text = final.payload["text"]
+    assert text.endswith("…"), "a cut sentence must be marked as cut"
+    assert final.payload["committed_text"] == ""
+    assert len(final.payload["generated_text"]) > len(text)
+    assert metrics.payload["degraded"] == "tts_partial"
+

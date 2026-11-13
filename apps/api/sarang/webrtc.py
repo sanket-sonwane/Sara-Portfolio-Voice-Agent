@@ -56,8 +56,17 @@ def _build_egress_track_class():
 
             if self.session.closed:
                 raise MediaStreamError
-            generation = self.session.generation
             samples = await self.egress.next_frame()
+            generation = int(samples.generation)
+            if generation != self.session.generation:
+                # Selected before an interrupt landed. Send silence for the
+                # current generation rather than the old turn's audio.
+                samples = np.zeros(FRAME_SAMPLES, dtype=np.int16)
+                generation = self.session.generation
+            else:
+                # "Submitted to aiortc" is the strongest claim available here;
+                # RTP encoding and transmission happen after recv() returns.
+                self.egress.ack_transport(generation, int(samples.sequence))
             array = samples.reshape(1, FRAME_SAMPLES).astype(np.int16)
             frame = av.AudioFrame.from_ndarray(array, format="s16", layout="mono")
             frame.sample_rate = 48_000

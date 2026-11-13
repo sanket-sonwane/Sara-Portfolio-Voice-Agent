@@ -8,6 +8,7 @@ to send and when it decides a turn is over.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from sarang.asr.base import ASREvent, ASRSession
@@ -60,6 +61,24 @@ class SilentFinalASR(FakeASR):
 
     async def finalize(self) -> None:
         self.finalizes += 1
+
+
+class DroppingASR(FakeASR):
+    """Drops audio the way Sarvam does when its outbox overflows.
+
+    ``dropped_ms`` is cumulative for the connection; the loop reports only the
+    delta from the start of the utterance, so this turn is not charged for the
+    previous one's loss.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dropped_ms = 100.0
+        self.drop_now = 240.0
+
+    async def finalize(self) -> None:
+        self.dropped_ms += self.drop_now
+        await super().finalize()
 
 
 @pytest.fixture
@@ -727,3 +746,84 @@ async def test_barge_in_cleans_up_the_abandoned_utterance(engine, monkeypatch):
         assert loop.current is not None and loop.current is not abandoned
     finally:
         await loop.close()
+
+
+async def test_dropped_asr_audio_is_reported_honestly(
+    engine, monkeypatch, no_turn, tmp_path
+):
+    """Audio the recogniser shed is part of the transcript's provenance.
+
+    Sarvam drops the oldest queued audio when its outbox overflows. The words
+    in that audio were never heard by the recogniser, so a transcript that
+    looks complete is a lie. The delta - not the connection's cumulative
+    counter - belongs to this utterance.
+    """
+    asr = DroppingASR()
+    monkeypatch.setattr("sarang.voice.build_asr", lambda settings: asr)
+
+    session = engine.create_session("test")
+    key, queue = engine.registry.bus.subscribe()
+    loop = UtteranceLoop(engine, session)
+    loop._dump_dir = tmp_path
+    try:
+        await loop.warm()
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+        # The baseline was 100 ms from an earlier utterance; this one loses
+        # another 240 ms during finalisation.
+        for _ in range(60):
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        finals = [event for event in events if event.type.value == "transcript.final"]
+        assert finals
+        assert finals[-1].payload["degraded"] == "asr_audio_dropped"
+        assert finals[-1].payload["dropped_ms"] == 240.0
+        assert finals[-1].payload["raw_text"] == "what did you build at arai"
+
+        dumps = list(tmp_path.glob("utt-*.json"))
+        assert len(dumps) == 1
+        payload = json.loads(dumps[0].read_text(encoding="utf-8"))
+        assert payload["degraded"] == "asr_audio_dropped"
+        assert payload["dropped_ms"] == 240.0
+        assert payload["raw_text"] == "what did you build at arai"
+        assert payload["text"] == "what did you build at arai"
+    finally:
+        await loop.close()
+
+
+async def test_a_clean_utterance_reports_no_degradation(engine, fake_asr, no_turn):
+    """Absence of corruption must be explicit as an empty field, not a guess."""
+    session = engine.create_session("test")
+    key, queue = engine.registry.bus.subscribe()
+    loop = UtteranceLoop(engine, session)
+    try:
+        await loop.warm()
+        for _ in range(6):
+            await loop.push(silence(20))
+        for i in range(10):
+            await loop.push(vocal(20, offset_ms=i * 20.0))
+        for _ in range(60):
+            await loop.push(silence(20))
+
+        task = loop._final_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        final = [event for event in events if event.type.value == "transcript.final"][-1]
+        assert final.payload["degraded"] == ""
+        assert final.payload["dropped_ms"] == 0.0
+    finally:
+        await loop.close()
+

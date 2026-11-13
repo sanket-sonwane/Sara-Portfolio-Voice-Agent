@@ -307,3 +307,271 @@ is a follow-up with its own design and benchmark.
   transports invalidates it.
 - **Credential rotation is still required** if the distributed ZIP contained
   `.env`; it is not part of this code change.
+
+---
+
+## 6. Second pass — isolation, egress lifecycle, audio protocol
+
+Date: 2026-11-13. Everything below is implemented and covered by tests
+(`pytest -q` 271 passed; `ruff` clean; `npm run build` passes).
+
+### 6.1 Session-scoped events
+
+- `Bus.subscribe(session_id)` keeps session queues separate from global ones;
+  `publish` routes by the envelope's `session_id`.
+- `/ws/events` filters again before writing, so a mis-stamped envelope cannot
+  cross sessions even if publishing is wrong somewhere else.
+- The browser rejects any `event.session_id` that is not the current session
+  **before** it can advance `generationRef`. A foreign epoch can no longer make
+  legitimate events look stale.
+- Tests: `tests/test_isolation.py`, `test_api.py::test_events_do_not_cross_session_boundaries`.
+
+### 6.2 Egress lifecycle
+
+`AudioEgress` now has `begin_generation`, `put`, `finish_generation`,
+`interrupt`, `ack_transport` and `wait_transport_drained`:
+
+- `begin_generation` clears the residual, so a previous turn's last partial
+  frame can no longer prepend itself to the next answer.
+- `finish_generation` switches the pre-buffer off and flushes/pads the final
+  partial frame. The "one frame stuck forever, session stays SPEAKING" failure
+  is gone.
+- `next_frame()` returns an `EgressFrame` carrying `generation` and `sequence`,
+  and re-checks the generation after the pacing sleep. A frame selected before
+  an interrupt is returned as silence, never as old audio.
+- Drain is decided on `ack_transport`, not on the queue looking empty.
+
+### 6.3 Audio protocol
+
+- `session.ready` advertises `audio_format: "pcm16-v2"`.
+- `/ws/audio` frames are `u32 generation | u32 sequence | pcm16`.
+- `Playback.enqueue` drops frames from an older generation or with a
+  non-increasing sequence, which closes the post-EPOCH window.
+- A client that receives an unknown `audio_format` refuses to parse binary
+  frames instead of guessing.
+
+### 6.4 ASR lifecycles
+
+- Batch Nemotron uses a persistent event queue: `events()` waits for
+  `finalize()` instead of exiting before a final exists.
+- Streaming Nemotron exposes `alive`, reports dead when its reader dies, and
+  tags every event with the turn from `begin_utterance()` rather than the
+  default index 0 that every later turn rejected as closed.
+
+### 6.5 Warm-up and shutdown
+
+- The audio route retains the warm-up task and cancels it on close.
+- `UtteranceLoop.warm()` closes an adapter it created after the loop closed, and
+  the adapter is never installed once `closed` is set.
+- `_begin_utterance` no longer waits on the ASR lock; an unready adapter drops
+  the onset and lets the detector fire again.
+- `Session.close()` closes the voice loop.
+- The audio route clears `session.voice` only when it still owns the slot.
+
+### 6.6 One turn owner
+
+- `Session.input_seq` gives each text submission an owner. `run_turn` returns
+  immediately when a newer submission exists, at entry and again after
+  acquiring `turn_lock`.
+- A typed question interrupts `user_speaking` as well as the producing states.
+- `orchestrator._interrupt_now` calls `voice.abandon_pending()`, which cancels
+  `_final_task` and marks the utterance superseded, so a transcript that arrives
+  after the typed question cannot start a second answer.
+
+### 6.7 generated / committed / audible
+
+`TurnText` (`apps/api/sarang/text_state.py`) records three separate values:
+
+- `generated` — the model's full output;
+- `committed` — segments whose synthesis completed and whose audio reached the
+  egress, in playback order;
+- `audible` — the prefix the browser reports playing (server hook:
+  `{"type": "audible", "turn_id": ..., "chars": n}`).
+
+`assistant.final` carries `text` (the honest transcript = committed, falling
+back to generated) plus `generated_text`, `committed_text`, `audible_text` and
+`audible_chars`. A partial TTS segment is not committed even if some of its
+audio was queued.
+
+### 6.8 Smaller corrections
+
+- Sarvam creates one resampler per audio blob; Smallest and Cartesia flush the
+  resampler's filter tail at completion. `StreamResampler.flush()` added.
+- English release configuration: `SMALLEST_LANGUAGE` defaults to `en` in
+  `config.py`, `fly.toml` and `.env.example`; code-switching remains available
+  explicitly with `SMALLEST_LANGUAGE=hi`.
+- Startup owns a `startSeq` token; `teardown()` clears it and `startingRef`, so
+  a stop during permission/session creation cannot permanently block restart.
+- WebRTC fallback is single-flight: the `failed` callback and the enclosing
+  `catch` share one `fallbackToPcm` promise, so one connection cannot open two
+  PCM sockets.
+
+### 6.9 Still open from the audit
+
+LLM mid-stream honest stop, TTS partial-tail recovery with alignment offsets,
+dropped-audio accounting in the transcript, follow-up entity resolution, the
+pronunciation lexicon, and the measurement split (browser-confirmed audible
+time vs scheduled time) remain for the next pass.
+
+---
+
+## 7. Third pass — honest degradation and a client-confirmed measurement
+
+Date: 2026-11-13. Implemented and covered by tests (`pytest -q` 291 passed;
+`ruff check apps tests bench` clean; `npm run build` passes). Everything here
+is about not claiming more than actually happened.
+
+### 7.1 LLM drops after the answer has started
+
+The old handler ran the local answerer for *any* provider failure. If the
+visitor had already heard two sentences, that appended a second, unrelated
+answer after them, and the transcript claimed a response the model never
+finished.
+
+`_run_turn` now separates the two cases:
+
+- nothing spoken yet (`not runtime.first_token and not runtime.segments`): the
+  local fallback runs as before;
+- speech started: `runtime.truncated = True`,
+  `marks.degraded = "llm_midstream"`, the answer is the prefix already emitted,
+  and `_stream_fallback` is **not** called. A `notice` tells the visitor the
+  model dropped.
+
+Tests: `tests/test_orchestrator.py::
+test_llm_failure_after_speech_keeps_the_prefix_and_does_not_fall_back`.
+
+### 7.2 TTS fails mid-segment
+
+`TTSPartialError` (in `tts/base.py`) means audio was emitted but the segment did
+not complete. `FallbackTTS` now has three outcomes:
+
+- **nothing emitted:** the fallback speaks the whole segment, as before;
+- **aligned partial:** `AudioSpan.text_range` gives the covered character
+  range, so the fallback speaks only `text[covered:].lstrip()` — never the
+  prefix the visitor already heard;
+- **unaligned partial:** the boundary is unknown, so it raises
+  `TTSPartialError` instead of replaying or pretending.
+
+`OrderedSpeech._synthesize` catches it, sets `degraded = "tts_partial"`,
+records the segment in `partial_segments`, and `submit()` refuses every later
+segment. The turn ends on the prefix it actually spoke. If nothing was
+committed, the transcript is the cut sentence with a `" …"` marker; the
+`generated_text` remains the full model output.
+
+Tests: `tests/test_tts_partial.py`, and
+`test_tts_partial_stops_the_turn_and_claims_only_a_cut_sentence` for the turn
+level.
+
+### 7.3 ASR audio that was never heard
+
+Sarvam sheds the oldest queued audio on outbox overflow. The recogniser never
+heard it, yet the transcript looked complete.
+
+- `_Utterance` records `raw_latest`, `raw_final`, `dropped_baseline` and
+  `dropped_ms`; the delta is taken from `begin_utterance()`, so one turn is not
+  charged for another's loss.
+- `transcript.final` carries `degraded` (`asr_audio_dropped` / `asr_timeout` /
+  `""`), `dropped_ms` and `raw_text`.
+- The ASR dump JSON carries the same fields.
+
+Tests: `test_dropped_asr_audio_is_reported_honestly` (dump + event) and
+`test_a_clean_utterance_reports_no_degradation`.
+
+### 7.4 Follow-ups resolve against the previous turn, without burying new subjects
+
+`is_followup(text, previous, current)` in `kb/lookup.py` replaced the
+orchestrator's bare regex. A pronoun (`it`, `that`, `this`, `the numbers`) or a
+continuation phrase (`tell me more`, `more about`, `and the`) means the question
+refers back. The one subject-introducing shape, `what about X?` / `how about X?`,
+is a follow-up only when X did not resolve a new confident block — so
+“what about QA-Forge?” keeps its own evidence.
+
+Tests: the follow-up block in `tests/test_lookup.py`.
+
+### 7.5 Pronunciation stays at the TTS boundary
+
+`tts/lexicon.py` maps identifiers and acronyms (`ARAI`, `MEC`, `VisionMitra`,
+`ClassNode`, `sched_ext`, …) to a spoken form. It is applied in
+`OrderedSpeech.submit` only: display text, the transcript and the evidence card
+keep the original spelling.
+
+### 7.6 The latency number is not the browser's “last chunk sent”
+
+The primary number is **server-side**: last detected speech frame →
+`transport_first_frame` (the first answer frame written to the wire).
+
+The browser cannot share the server's monotonic clock, so it reports deltas
+measured from the first voiced binary frame it received:
+
+- `scheduled_ms` — until the first buffer is scheduled (`Playback.audibleFrom`);
+- `audible_ms` — until `getOutputTimestamp()` confirms the output device reached
+  it (`Playback.audibleConfirmedFrom()`).
+
+`TurnMarks.client_payload()` adds them to `eos_to_transport_first_frame_ms`,
+producing `eos_to_client_scheduled_ms` and `eos_to_client_audible_ms`. The late
+report arrives as a `metrics.client` event and is merged into the turn by
+`MetricsStore.observe_client`.
+
+`bench/eval.py` now reports `eos_to_transport_first_frame` as the primary
+metric, `eos_to_client_audible` as the confirmed figure when a browser sent one,
+and labels `answer_first_audio_provider_output` as provider output rather than
+something the visitor heard.
+
+`assistant.final` text is the committed prefix (or generated text when nothing
+was committed); `audible_text` is only ever set from the browser report.
+
+### 7.7 Deployed endpoint experiment (2026-11-13)
+
+Target: `sarang-gateway.fly.dev` (`sin`, `SARANG_PROFILE=bom-india`, Sarvam ASR +
+Sarvam LLM, Smallest Lightning TTS). Five turns per window, same fixture
+(`bench/audio/question-16k.wav`, one 460 ms internal pause). Primary number is
+the server's last-speech-frame → first frame on the wire.
+
+| `ENDPOINT_SILENCE_MS` | endpoint stage | EOS→wire p50 | p90 | p95 | client p50 |
+| --- | --- | --- | --- | --- | --- |
+| 800 (baseline) | 860 ms | 1676 ms | 1952 ms | 1967 ms | 1918 ms |
+| 650 | 760 ms | 1718 ms | 1972 ms | 2054 ms | 2052 ms |
+| 500 (shipped) | 560 ms | 1586 ms | 1828 ms | 1897 ms | 1855 ms |
+
+All 15 transcripts were identical and correct, including the 500 ms window: the
+460 ms pause did not split a turn. The endpoint stage moved by exactly the
+configured amount each time (860 → 760 → 560; the extra 60 ms is the detector's
+frame granularity).
+
+EOS→wire did **not** fall by 300 ms across the experiment because the legs after
+endpointing vary more than the window being removed. At 500 ms the p50 breaks
+down as 560 endpoint + 240 ASR final + 414 LLM TTFT + 32 segmentation + 253 TTS
+first audio + 82 egress. Even with endpointing at zero, that cascade is ~1.0 s.
+**600 ms is not reachable without producing audio before the final transcript
+is validated**; shortening the silence window only moves a fraction of it.
+
+Results:
+
+- `bench/results/e2e-turn-deployed-sin-800ms-20261113-190821.json`
+- `bench/results/e2e-turn-deployed-sin-650ms-20261113-191240.json`
+- `bench/results/e2e-turn-deployed-sin-500ms-20261113-191658.json`
+
+The deployed value was **500 ms** when this work shipped. The 800 ms row is the
+baseline it replaced; 650 was rejected as noise within the p90 spread. The probe
+was fixed first: it used to parse the pcm16-v2 header as samples, which makes
+every frame look voiced (the generation word is non-zero) and would have
+reported a flattering first-frame time. It now strips and validates
+`u32 generation | u32 sequence`, and reports p50/p90/p95.
+
+Five turns per window is enough to show the endpoint stage moved by exactly the
+configured amount, but not enough to separate the post-endpoint stages from
+provider jitter. Treat the 500→800 p50 gap as directional until a 20–30 turn run
+confirms it on the shipped build.
+
+### 7.8 Still open
+
+- The `metrics.client` event and the `audible` control message are not yet in
+  the README or the public docs.
+- `wait_transport_drained` can wait up to 30 s when a transport never acks.
+  Correct, but the ceiling should be configurable before the next long soak.
+- `eos_to_transport_first_frame` includes a cached filler when one is played, so
+  it is "first audio on the wire", not always "first answer frame". The
+  distinction is visible in `eos_to_answer_audio_ms`; keep both when reporting.
+
+
+

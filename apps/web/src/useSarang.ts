@@ -249,6 +249,12 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
   const generationRef = useRef(0);
   const lifespanRef = useRef(0);
   const startingRef = useRef(false);
+  // Ownership of one startup. A stop during permission/session creation bumps
+  // this so the abandoned startup cannot clear a newer startup's flag.
+  const startSeqRef = useRef(0);
+  // One PCM fallback per connection. The WebRTC failed callback and the
+  // enclosing catch can both fire; they must share the same socket.
+  const pcmFallbackRef = useRef<Promise<void> | null>(null);
   const endedRef = useRef(false);
   const wantMicRef = useRef(true);
   const transportReadyRef = useRef(false);
@@ -269,6 +275,14 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
   // cannot measure: the return network path plus playback start.
   const eosAtRef = useRef<number | null>(null);
   const turnAudibleAtRef = useRef<number | null>(null);
+  // Server-clock-free measurement. The first voiced binary frame is the point
+  // this client can see; playback scheduling and output confirmation are both
+  // measured from it, and the gateway adds its own last-speech -> transport
+  // stamp. `audibleFrom` alone is a prediction, so a confirmed stamp is sent
+  // separately when the device clock reports it.
+  const turnFirstFrameAtRef = useRef<number | null>(null);
+  const turnCommittedRef = useRef<{ turnId: string; text: string } | null>(null);
+  const audibleReportSentRef = useRef(false);
   const prevServerStateRef = useRef<api.ServerState>("idle");
   const noiseFloorRef = useRef(0.01);
   const openEventsRef = useRef<(session: api.SessionResponse, lifespan: number) => void>(() => undefined);
@@ -364,6 +378,10 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
     (notifyServer: boolean) => {
       endedRef.current = true;
       lifespanRef.current += 1;
+      // Any startup still awaiting permission is no longer the owner.
+      startSeqRef.current += 1;
+      startingRef.current = false;
+      pcmFallbackRef.current = null;
       if (reconnectTimerRef.current) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -399,6 +417,9 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
         // the previous turn's stamps must not be reused.
         turnAudibleAtRef.current = null;
         eosAtRef.current = null;
+        turnFirstFrameAtRef.current = null;
+        turnCommittedRef.current = null;
+        audibleReportSentRef.current = false;
       } else if (prevServerStateRef.current === "user_speaking") {
         // The server decided the turn ended. Everything after this point is the
         // leg the visitor actually waits through, measured from here.
@@ -468,10 +489,59 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
     [closeAudio, closeEvents, setMuted, setUiError, setViewState],
   );
 
+  // Browser-side playback report. Defined before handleEvent because the
+  // assistant.final branch schedules it.
+  const reportAudible = useCallback((turnId: string) => {
+    if (!turnId || audibleReportSentRef.current) return;
+    const firstFrameAt = turnFirstFrameAtRef.current;
+    if (firstFrameAt === null) return;
+    const committed = turnCommittedRef.current;
+    const text = committed && committed.turnId === turnId ? committed.text : "";
+    let attempts = 0;
+    const send = () => {
+      if (audibleReportSentRef.current) return;
+      const playback = playbackRef.current;
+      const socket = audioRef.current;
+      if (!playback || !socket) return;
+      const scheduledAt = playback.audibleFrom;
+      if (scheduledAt === null) {
+        if (attempts++ < 100) window.setTimeout(send, 20);
+        return;
+      }
+      const confirmedAt = playback.audibleConfirmedFrom();
+      if (confirmedAt === null && attempts++ < 100) {
+        window.setTimeout(send, 20);
+        return;
+      }
+      const scheduledMs = Math.max(0, scheduledAt - firstFrameAt);
+      const audibleMs =
+        confirmedAt === null ? undefined : Math.max(0, confirmedAt - firstFrameAt);
+      // Character progress is an estimate from playback time. The server keeps
+      // it separate from `committed_text`, which is exact.
+      const chars = text ? Math.round(text.length * playback.progress()) : undefined;
+      socket.sendControl({
+        type: "audible",
+        turn_id: turnId,
+        chars,
+        scheduled_ms: Math.round(scheduledMs),
+        audible_ms: audibleMs === undefined ? undefined : Math.round(audibleMs),
+      });
+      audibleReportSentRef.current = true;
+    };
+    send();
+  }, []);
+
   const handleEvent = useCallback(
     (event: api.ServerEvent) => {
       if (!mountedRef.current) return;
       if (event.type === "ping") return;
+      // Second isolation layer. The server routes by session, but an event that
+      // belongs to another conversation must not even advance our generation
+      // counter: a foreign epoch would make legitimate events look stale.
+      const currentSession = sessionRef.current;
+      if (currentSession && event.session_id && event.session_id !== currentSession.session_id) {
+        return;
+      }
       const generation = Number(event.generation_id) || 0;
       if (generation > generationRef.current) generationRef.current = generation;
       const stale = generation > 0 && generation < generationRef.current;
@@ -502,6 +572,15 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
         case "session.ready": {
           const nextConfig = event.payload.config as api.SarangConfig | undefined;
           if (nextConfig) setConfig(nextConfig);
+          if (nextConfig?.audio_format && nextConfig.audio_format !== "pcm16-v2") {
+            // Never guess how to parse a binary frame. An unrecognised format
+            // is a stale tab talking to a newer gateway.
+            setUiError({
+              message: "This page is out of date. Reload to reconnect to the voice channel.",
+              recoverable: true,
+            });
+            break;
+          }
           setConnected(true);
           if (viewRef.current === "reconnecting") {
             setViewState(transportReadyRef.current || !wantMicRef.current ? "connected" : "connecting", "Connected");
@@ -609,6 +688,18 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
         case "assistant.final": {
           const text = String(event.payload.text ?? "").trim();
           if (!text) break;
+          const committedText = String(event.payload.committed_text ?? "");
+          if (committedText) {
+            turnCommittedRef.current = { turnId: event.turn_id, text: committedText };
+          }
+          // Ask the playback graph to confirm what was heard. The turn can
+          // finish on the wire before the browser has played the first frame.
+          reportAudible(event.turn_id);
+          // Both stamps describe this turn only. Consuming them here keeps a
+          // later text turn (which never sends `user_speaking`) from reporting
+          // a delta measured from an earlier answer's first frame.
+          turnFirstFrameAtRef.current = null;
+          turnCommittedRef.current = null;
           const tracked = assistantIdRef.current;
           assistantIdRef.current = null;
           setTranscript((previous) => {
@@ -711,6 +802,16 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           }
           break;
         }
+        case "metrics.client": {
+          const payload = event.payload as unknown as api.TurnMetrics;
+          if (!payload?.turn_id) break;
+          setLastTurn((previous) =>
+            previous && previous.turn_id === payload.turn_id
+              ? { ...previous, ...payload }
+              : previous,
+          );
+          break;
+        }
         case "epoch": {
           const nextGeneration = Number(event.payload.generation);
           if (Number.isFinite(nextGeneration)) generationRef.current = nextGeneration;
@@ -744,7 +845,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           break;
       }
     },
-    [applyServerState, pushNotice, remoteAudio, setMuted, setUiError, setViewState],
+    [applyServerState, pushNotice, remoteAudio, reportAudible, setMuted, setUiError, setViewState],
   );
 
   // --------------------------------------------------------------- network
@@ -906,10 +1007,19 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           sr: micRef.current?.sampleRate ?? 48_000,
         }),
         {
-          onAudio: (pcm) => {
+          onAudio: (pcm, generation, sequence) => {
             const playback = playbackRef.current;
             if (!playback) return;
-            playback.enqueue(pcm);
+            playback.enqueue(pcm, generation, sequence);
+            // The first frame carrying a sample is the first point this client
+            // can time. A silent frame is transport pacing, not speech.
+            if (
+              turnFirstFrameAtRef.current === null &&
+              generation >= generationRef.current &&
+              pcm.some((sample) => sample !== 0)
+            ) {
+              turnFirstFrameAtRef.current = performance.now();
+            }
             // Snapshot the first run of playback for this turn. Reading it later
             // would be wrong: a dry spell mid-answer starts a new run and would
             // overwrite the only stamp that answers "when did the visitor hear
@@ -966,6 +1076,23 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
     [pushNotice, setViewState, startBargeWatch],
   );
 
+  // Single-flight fallback: a WebRTC `failed` event and the rejection it
+  // causes are the same failure, and both used to open a PCM socket.
+  const fallbackToPcm = useCallback(
+    (session: api.SessionResponse, lifespan: number): Promise<void> => {
+      if (pcmFallbackRef.current) return pcmFallbackRef.current;
+      const attempt = startPcm(session, lifespan).catch((error) => {
+        // A failed attempt must be retryable by the next reconnect; a
+        // successful one owns the socket for the rest of the connection.
+        pcmFallbackRef.current = null;
+        throw error;
+      });
+      pcmFallbackRef.current = attempt;
+      return attempt;
+    },
+    [startPcm],
+  );
+
   const startAudio = useCallback(
     async (session: api.SessionResponse, lifespan: number) => {
       if (lifespan !== lifespanRef.current || endedRef.current) return;
@@ -1009,7 +1136,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
                 pushNotice("The WebRTC connection failed. Falling back to WebSocket audio.", "warning");
                 rtcRef.current?.close();
                 rtcRef.current = null;
-                void startPcm(session, lifespan).catch(() => {
+                void fallbackToPcm(session, lifespan).catch(() => {
                   setUiError({
                     message: "The audio channel could not be established. You can still type.",
                     recoverable: true,
@@ -1041,7 +1168,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
       }
 
       try {
-        await startPcm(session, lifespan);
+        await fallbackToPcm(session, lifespan);
         analysersRef.current.output = playback.analyser;
         setAudioRunning(playback.running);
       } catch (error) {
@@ -1057,7 +1184,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
         setViewState("error", "Audio unavailable");
       }
     },
-    [pushNotice, remoteAudio, setUiError, setViewState, startBargeWatch, startPcm],
+    [pushNotice, remoteAudio, setUiError, setViewState, startBargeWatch, fallbackToPcm],
   );
 
   useEffect(() => {
@@ -1070,6 +1197,9 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
     async (options?: { mic?: boolean }) => {
       if (startingRef.current || sessionRef.current) return;
       startingRef.current = true;
+      startSeqRef.current += 1;
+      const startSeq = startSeqRef.current;
+      pcmFallbackRef.current = null;
       endedRef.current = false;
       reconnectEventsRef.current = false;
       reconnectAudioRef.current = false;
@@ -1110,7 +1240,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
             if (mutedRef.current) return;
             audioRef.current?.send(pcm);
           });
-          if (lifespan !== lifespanRef.current) {
+          if (lifespan !== lifespanRef.current || startSeq !== startSeqRef.current) {
             void mic.stop();
             return;
           }
@@ -1118,11 +1248,11 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           analysersRef.current.input = mic.analyser;
           setMicReady(true);
         } catch (error) {
-          if (lifespan !== lifespanRef.current) return;
+          if (lifespan !== lifespanRef.current || startSeq !== startSeqRef.current) return;
           const message = microphoneErrorMessage(error);
           setUiError({ message, recoverable: true, code: "mic" });
           setViewState("error", message);
-          startingRef.current = false;
+          if (startSeq === startSeqRef.current) startingRef.current = false;
           return;
         }
       }
@@ -1131,7 +1261,9 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
       connectStartedRef.current = performance.now();
       try {
         const session = await api.createSession("web");
-        if (lifespan !== lifespanRef.current || endedRef.current) return;
+        if (lifespan !== lifespanRef.current || startSeq !== startSeqRef.current || endedRef.current) {
+          return;
+        }
         sessionRef.current = session;
         setConfig(session.config);
         setActive(true);
@@ -1154,7 +1286,9 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
         sessionRef.current = null;
         setActive(false);
       } finally {
-        if (lifespan === lifespanRef.current) startingRef.current = false;
+        // The startup that owns the flag clears it. A superseded startup never
+        // does, and teardown already cleared it when it bumped the token.
+        if (startSeq === startSeqRef.current) startingRef.current = false;
       }
     },
     [clearNotice, closeAudio, closeEvents, closeMic, setMuted, setUiError, setViewState],

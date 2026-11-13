@@ -154,8 +154,10 @@ class Settings:
     smallest_key: str = ""
     smallest_model: str = "lightning_v3.1_pro"
     smallest_voice: str = "rhea"
-    # "hi" is Indian-accented English with Hindi code-switching; "en" is UK/US.
-    smallest_language: str = "hi"
+    # "en" is the English release configuration. "hi" is Indian-accented
+    # English with Hindi code-switching; it is still available explicitly, but
+    # it is no longer the default when the release is English-only.
+    smallest_language: str = "en"
     smallest_ws_url: str = "wss://api.smallest.ai/waves/v1/tts/live"
     # Lightning allows 10-15 concurrent streams. Four covers the two or three
     # segments a 35-word answer produces without letting a burst look abusive.
@@ -380,7 +382,7 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         smallest_key=get("SMALLEST_API_KEY"),
         smallest_model=get("SMALLEST_MODEL", "lightning_v3.1_pro"),
         smallest_voice=get("SMALLEST_VOICE", "rhea"),
-        smallest_language=get("SMALLEST_LANGUAGE", "hi"),
+        smallest_language=get("SMALLEST_LANGUAGE", "en"),
         smallest_ws_url=get(
             "SMALLEST_WS_URL", "wss://api.smallest.ai/waves/v1/tts/live"
         ),

@@ -62,6 +62,51 @@ def test_session_returns_token_and_ice(client):
     assert token.count(".") == 2
 
 
+def _drain_to_pong(ws) -> list[str]:
+    """Read until the pong, returning the types seen on the way."""
+    ws.send_json({"type": "ping"})
+    seen: list[str] = []
+    for _ in range(20):
+        message = ws.receive_json()
+        seen.append(str(message.get("type", "")))
+        if message.get("type") == "pong":
+            break
+    return seen
+
+
+def test_events_do_not_cross_session_boundaries(client):
+    from sarang.schemas import Envelope, EventType
+
+    id_a, token_a = open_session(client)
+    id_b, token_b = open_session(client)
+    with client.websocket_connect(
+        f"/ws/events?session_id={id_a}&token={token_a}"
+    ) as ws_a, client.websocket_connect(
+        f"/ws/events?session_id={id_b}&token={token_b}"
+    ) as ws_b:
+        assert ws_a.receive_json()["type"] == "session.ready"
+        assert ws_b.receive_json()["type"] == "session.ready"
+        _drain_to_pong(ws_a)
+        _drain_to_pong(ws_b)
+
+        client.app.state.bus.publish(
+            Envelope(
+                type=EventType.NOTICE,
+                session_id=id_a,
+                payload={"message": "only for A"},
+            )
+        )
+
+        notice = ws_a.receive_json()
+        assert notice["type"] == "notice"
+        assert notice["session_id"] == id_a
+
+        # B asks for a pong. If the notice had leaked, it would be queued ahead
+        # of the pong and appear in this list.
+        seen = _drain_to_pong(ws_b)
+        assert "notice" not in seen
+
+
 def test_missing_token_is_rejected(client):
     session_id, _ = open_session(client)
     response = client.post(

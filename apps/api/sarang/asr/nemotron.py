@@ -54,8 +54,15 @@ class NemotronASR(ASRSession):
         self.sample_rate = sample_rate
         self.stream_url = stream_url
         self._buffer: list[np.ndarray] = []
-        self._final: ASREvent | None = None
+        # Persistent event queue: the reader starts when the adapter connects,
+        # long before the first final exists. A one-shot generator exited
+        # immediately and the final produced by ``finalize`` was never read.
+        self._events: asyncio.Queue[ASREvent | None] = asyncio.Queue()
         self._closed = False
+
+    @property
+    def alive(self) -> bool:
+        return not self._closed
 
     async def push(self, pcm: bytes) -> None:
         if self._closed:
@@ -63,8 +70,11 @@ class NemotronASR(ASRSession):
         self._buffer.append(np.frombuffer(pcm, dtype="<i2").astype(np.int16))
 
     async def events(self) -> AsyncIterator[ASREvent]:
-        if self._final is not None and self._final.text:
-            yield self._final
+        while True:
+            event = await self._events.get()
+            if event is None:
+                return
+            yield event
 
     async def finalize(self) -> None:
         if self._closed or not self._buffer:
@@ -82,11 +92,13 @@ class NemotronASR(ASRSession):
         except httpx.HTTPError as error:
             raise ASRError(f"nemotron asr failed: {error}") from error
         text = str(payload.get("text", "")).strip()
-        self._final = ASREvent(text=text, final=True, confidence=0.9)
+        # The queue, not an attribute the reader has already stopped watching.
+        self._events.put_nowait(ASREvent(text=text, final=True, confidence=0.9))
 
     async def close(self) -> None:
         self._closed = True
         self._buffer.clear()
+        self._events.put_nowait(None)
         await asyncio.sleep(0)
 
 
@@ -108,6 +120,27 @@ class NemotronStreamASR(ASRSession):
         self._queue: asyncio.Queue[ASREvent | None] = asyncio.Queue()
         self._reader: asyncio.Task | None = None
         self._closed = False
+        # A persistent stream serves every turn, so events must carry the turn
+        # they belong to. The default index 0 made every turn after the first
+        # look like a late event for a closed utterance.
+        self._turn = 0
+        self._dead = False
+
+    @property
+    def alive(self) -> bool:
+        return (
+            not self._closed
+            and not self._dead
+            and self._socket is not None
+            and self._reader is not None
+            and not self._reader.done()
+        )
+
+    async def begin_utterance(self) -> bool:
+        if not self.alive:
+            return False
+        self._turn += 1
+        return True
 
     async def connect(self) -> None:
         try:
@@ -115,6 +148,7 @@ class NemotronStreamASR(ASRSession):
         except ImportError:  # pragma: no cover
             from websockets import connect as ws_connect  # type: ignore
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        self._dead = False
         self._socket = await ws_connect(
             self.url, additional_headers=headers, max_size=None, open_timeout=self.open_timeout
         )
@@ -134,10 +168,18 @@ class NemotronStreamASR(ASRSession):
                 if not text:
                     continue
                 final = bool(body.get("is_final") or body.get("final") or body.get("done"))
-                await self._queue.put(ASREvent(text=str(text).strip(), final=final, confidence=0.9))
+                await self._queue.put(
+                    ASREvent(
+                        text=str(text).strip(),
+                        final=final,
+                        confidence=0.9,
+                        utterance=self._turn,
+                    )
+                )
         except Exception:
             pass
         finally:
+            self._dead = True
             await self._queue.put(None)
 
     async def push(self, pcm: bytes) -> None:
@@ -159,8 +201,13 @@ class NemotronStreamASR(ASRSession):
 
     async def close(self) -> None:
         self._closed = True
+        self._dead = True
         if self._reader:
             self._reader.cancel()
+            try:
+                await self._reader
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._socket is not None:
             try:
                 await self._socket.close()

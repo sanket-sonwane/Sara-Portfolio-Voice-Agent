@@ -21,6 +21,7 @@ from .kb.lookup import LookupResult
 from .llm.base import Message
 from .metrics import TurnMarks
 from .schemas import EventType, SessionState, new_session_id
+from .text_state import TurnText
 
 
 @dataclass
@@ -37,10 +38,16 @@ class Session:
     turn_counter: int = 0
     active_turn: str = ""
     turn_task: asyncio.Task | None = None
+    # Monotonic input sequence. A new text submission supersedes an older one:
+    # two rapid submits used to queue under ``turn_lock`` and both run.
+    input_seq: int = 0
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     history: list[Message] = field(default_factory=list)
     marks: dict[int, TurnMarks] = field(default_factory=dict)
+    # Per-turn text states. Kept so a late browser playback report can be
+    # applied to the turn it belongs to, even after the turn finished.
+    text_by_turn: dict[str, TurnText] = field(default_factory=dict)
     last_lookup: LookupResult | None = None
     speculation: Any = None
 
@@ -112,6 +119,10 @@ class Session:
         self.generation += 1
         self.turn_counter += 1
         self.active_turn = f"trn_{self.turn_counter:04d}"
+        # Keep only the recent turns' text states.
+        if len(self.text_by_turn) > 8:
+            for stale in list(self.text_by_turn)[: len(self.text_by_turn) - 8]:
+                self.text_by_turn.pop(stale, None)
         return self.active_turn, self.generation
 
     def cancel_active_turn(self) -> None:
@@ -128,6 +139,12 @@ class Session:
             # A closed session stops paying for speculative streams.
             with contextlib.suppress(Exception):
                 speculation.reset()
+        if self.voice is not None:
+            # The loop owns the ASR reader; close it before the adapter so the
+            # reader cannot reconnect a socket for a session that is ending.
+            voice, self.voice = self.voice, None
+            with contextlib.suppress(Exception):
+                await voice.close()
         if self.asr is not None:
             with contextlib.suppress(Exception):
                 await self.asr.close()

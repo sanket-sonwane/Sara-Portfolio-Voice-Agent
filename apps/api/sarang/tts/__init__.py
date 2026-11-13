@@ -2,19 +2,25 @@
 
 The wrapper is the part that matters in production. A provider can connect and
 then fail mid-utterance; the turn must not die with a socket error, and the
-visitor must not be left in silence. Every failure after the first byte is
-answered by the synthetic voice for the remaining segments, and the turn metrics
-record the degradation.
+visitor must not be left in silence.
+
+The recovery depends on what the provider can prove:
+
+* nothing emitted - the synthetic voice speaks the whole segment;
+* emitted, with alignment - the synthetic voice speaks only the unspoken tail;
+* emitted, without alignment - the spoken boundary is unknown, so the turn stops
+  on the prefix it actually spoke and the metrics record the degradation.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ..config import Settings
-from .base import TTS, AudioSpan, TTSError
+from .base import TTS, AudioSpan, TTSError, TTSPartialError
 from .cartesia import CartesiaTTS
 from .sarvam import SarvamTTS
 from .smallest import SmallestTTS
@@ -42,21 +48,46 @@ class FallbackTTS(TTS):
         metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[AudioSpan]:
         emitted = False
+        # Highest character offset the provider reported as covered. Only
+        # meaningful while every span carried alignment.
+        covered = 0
+        aligned = True
         try:
             async for span in self.primary.synthesize(
                 text, context_id=context_id, final=final, metadata=metadata
             ):
                 emitted = True
+                if span.text_range is None:
+                    aligned = False
+                else:
+                    covered = max(covered, span.text_range[1])
                 yield span
             return
-        except (TTSError, Exception) as error:  # noqa: BLE001
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
             log.warning("tts %s failed: %s", self.primary.name, error)
-            if emitted:
-                self.degraded_turns += 1
-                # Do not repeat what has already been spoken; finish this
-                # segment only if the primary produced nothing at all.
+            self.degraded_turns += 1
+            if not emitted:
+                # Nothing was spoken, so the fallback may say the whole segment.
+                pass
+            elif aligned and covered < len(text):
+                # The provider told us exactly where it stopped. Resume only
+                # the unspoken tail; repeating the prefix is worse than a
+                # different voice for the tail.
+                tail = text[covered:].lstrip()
+                if not tail:
+                    return
+                async for span in self.fallback.synthesize(
+                    tail, context_id=context_id, final=final, metadata=metadata
+                ):
+                    yield span
                 return
-        self.degraded_turns += 1
+            else:
+                # No alignment: the spoken boundary is unknown. Do not replay
+                # the segment and do not pretend it was completed; the turn
+                # stops on the prefix it actually spoke.
+                raise TTSPartialError(text, covered if aligned else 0) from error
         async for span in self.fallback.synthesize(
             text, context_id=context_id, final=final, metadata=metadata
         ):
@@ -102,4 +133,4 @@ def build_tts(settings: Settings) -> TTS:
     return SyntheticTTS()
 
 
-__all__ = ["AudioSpan", "FallbackTTS", "TTSError", "TTS", "build_tts"]
+__all__ = ["AudioSpan", "FallbackTTS", "TTSError", "TTSPartialError", "TTS", "build_tts"]

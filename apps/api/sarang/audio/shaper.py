@@ -1,6 +1,6 @@
 """Egress shaper.
 
-The only writer to the outbound audio track. It guarantees three properties:
+The only writer to the outbound audio track. It guarantees four properties:
 
 1. **Fixed framing.** Every frame is exactly 960 samples at 48 kHz. A variable
    frame size forces the browser to rebuffer and shows up as a stutter, not a
@@ -10,6 +10,10 @@ The only writer to the outbound audio track. It guarantees three properties:
    cancel; this is where the promise is kept.
 3. **Pacing.** Frames are released on a monotonic deadline so playback does not
    drift when the event loop is busy.
+4. **An explicit lifecycle.** A turn begins a generation, streams audio, finishes
+   it, and only then can "drained" mean anything. Selection is not delivery: the
+   transport acknowledges each frame it accepted, and the drain signal waits for
+   that acknowledgement instead of for the queue to look empty.
 """
 
 from __future__ import annotations
@@ -64,6 +68,34 @@ class AudioChunk:
     turn_id: str
 
 
+class EgressFrame(np.ndarray):
+    """One paced frame plus the generation and sequence it was selected for.
+
+    A numpy subclass so existing callers can keep treating a frame as samples,
+    while the transports can refuse to send a frame whose generation is no
+    longer current.
+    """
+
+    generation: int
+    sequence: int
+
+    def __new__(cls, samples: np.ndarray, generation: int, sequence: int) -> EgressFrame:
+        obj = np.asarray(samples).view(cls)
+        obj.generation = generation
+        obj.sequence = sequence
+        return obj
+
+    def __array_finalize__(self, obj) -> None:
+        if obj is None:
+            return
+        self.generation = getattr(obj, "generation", 0)
+        self.sequence = getattr(obj, "sequence", 0)
+
+    @property
+    def silent(self) -> bool:
+        return not bool(self.any())
+
+
 class AudioEgress:
     def __init__(self, *, prebuffer_ms: int = 40, flush_guard_ms: int = 80) -> None:
         self.generation = 0
@@ -74,6 +106,13 @@ class AudioEgress:
         self._flush_guard_s = flush_guard_ms / 1000.0
         self._deadline: float | None = None
         self._first_audio_sent: set[int] = set()
+        # Generations that will produce no more audio. Only these can drain.
+        self._finished: set[int] = set()
+        # Highest frame sequence emitted per generation, and the highest one the
+        # transport confirmed handing off. Drain is decided on the second.
+        self._seq: dict[int, int] = {}
+        self._last_audio_seq: dict[int, int] = {}
+        self._acked: dict[int, int] = {}
         # One drained signal per generation: "every sample this generation will
         # produce has been handed to the transport". The turn lifecycle uses it
         # to stay SPEAKING until the answer is actually over.
@@ -85,8 +124,51 @@ class AudioEgress:
 
     # ------------------------------------------------------------------ control
 
-    def set_generation(self, generation: int) -> None:
+    def begin_generation(self, generation: int) -> None:
+        """Start a turn. Residual audio from the previous one is discarded.
+
+        Not clearing the residual is how 40 samples of the previous answer ended
+        up in front of the next one: the new turn's first frame was built from
+        the old remainder plus the new audio.
+        """
         self.generation = generation
+        self._chunks.clear()
+        self._residual = np.zeros(0, dtype=np.int16)
+        self._deadline = None
+        self._seq[generation] = 0
+        self._acked.pop(generation, None)
+        self._last_audio_seq.pop(generation, None)
+        self._finished.discard(generation)
+        self._drained.pop(generation, None)
+        # Prune completed generations so the maps do not grow for a long call.
+        for stale in [key for key in self._finished if key < generation]:
+            self._finished.discard(stale)
+            self._drained.pop(stale, None)
+            self._seq.pop(stale, None)
+            self._last_audio_seq.pop(stale, None)
+            self._acked.pop(stale, None)
+
+    # Backwards compatible name; the behaviour is the new lifecycle's.
+    def set_generation(self, generation: int) -> None:
+        self.begin_generation(generation)
+
+    def finish_generation(self, generation: int) -> None:
+        """Declare that no more audio will be queued for this generation.
+
+        Streaming keeps its two-frame pre-buffer, but the end of a turn must
+        not: otherwise one remaining frame sits in the queue forever and the
+        turn waits out the drain timeout in ``SPEAKING``.
+        """
+        if generation == self.generation:
+            self._finished.add(generation)
+            # The legacy "queue looks empty" signal may already have fired
+            # before the turn declared itself finished. Re-open the drain and
+            # let the transport's acknowledgement close it, so a selected frame
+            # is never mistaken for a delivered one.
+            event = self._drained.get(generation)
+            if event is not None:
+                event.clear()
+            self._maybe_drained(generation)
 
     def interrupt(self, generation: int | None = None) -> None:
         """Drop queued audio and emit silence while the browser flushes."""
@@ -95,10 +177,18 @@ class AudioEgress:
         self._residual = np.zeros(0, dtype=np.int16)
         self._flush_guard_until = time.perf_counter() + self._flush_guard_s
         self._deadline = None
+        self._finished.discard(self.generation)
         # Release anybody waiting for the old generation to finish playing: it
         # is not going to finish, and the new turn must not wait for it.
         for event in self._drained.values():
             event.set()
+
+    def ack_transport(self, generation: int, sequence: int) -> None:
+        """The transport accepted this frame. This is what completes a drain."""
+        current = self._acked.get(generation, -1)
+        if sequence > current:
+            self._acked[generation] = sequence
+        self._maybe_drained(generation)
 
     def _drain_event(self, generation: int) -> asyncio.Event:
         event = self._drained.get(generation)
@@ -107,7 +197,16 @@ class AudioEgress:
             self._drained[generation] = event
         return event
 
-    async def wait_drained(self, generation: int, timeout: float = 30.0) -> bool:
+    def _maybe_drained(self, generation: int) -> None:
+        if generation != self.generation or generation not in self._finished:
+            return
+        if self._chunks or self._residual.size:
+            return
+        if self._acked.get(generation, -1) < self._last_audio_seq.get(generation, -1):
+            return
+        self._drain_event(generation).set()
+
+    async def wait_transport_drained(self, generation: int, timeout: float = 30.0) -> bool:
         """Wait until this generation has no audio left to hand to the wire.
 
         This is transport-level completion, not speaker-level: the browser
@@ -115,7 +214,9 @@ class AudioEgress:
         stop calling itself ``speaking``, and it deliberately releases early on
         an interrupt (the old generation is cancelled, not played out).
         """
-        if generation != self.generation or (
+        if generation != self.generation:
+            return True
+        if generation not in self._finished and (
             not self._chunks and len(self._residual) < FRAME_SAMPLES
         ):
             return True
@@ -125,6 +226,10 @@ class AudioEgress:
         except TimeoutError:
             return False
         return True
+
+    # Kept as the name the orchestrator already calls.
+    async def wait_drained(self, generation: int, timeout: float = 30.0) -> bool:
+        return await self.wait_transport_drained(generation, timeout=timeout)
 
     # -------------------------------------------------------------------- input
 
@@ -152,7 +257,7 @@ class AudioEgress:
 
     # ------------------------------------------------------------------- output
 
-    def _next_chunk_frame(self) -> np.ndarray:
+    def _next_chunk_frame(self, *, flush: bool) -> np.ndarray:
         while len(self._residual) < FRAME_SAMPLES and self._chunks:
             chunk = self._chunks.popleft()
             if chunk.generation != self.generation:
@@ -166,23 +271,43 @@ class AudioEgress:
             frame = self._residual[:FRAME_SAMPLES]
             self._residual = self._residual[FRAME_SAMPLES:]
             return frame
+        if flush and self._residual.size:
+            # The end of a turn: a partial frame is padded with silence and
+            # released now, not held for a next chunk that will never come.
+            frame = np.zeros(FRAME_SAMPLES, dtype=np.int16)
+            frame[: self._residual.size] = self._residual
+            self._residual = np.zeros(0, dtype=np.int16)
+            return frame
         return silent_frame(FRAME_SAMPLES)
 
-    async def next_frame(self) -> np.ndarray:
-        """Return one 20 ms frame, paced against a monotonic deadline."""
+    def _sequence(self, generation: int) -> int:
+        sequence = self._seq.get(generation, 0)
+        self._seq[generation] = sequence + 1
+        return sequence
+
+    async def next_frame(self) -> EgressFrame:
+        """Return one paced 20 ms frame, tagged with its generation/sequence."""
         async with self._lock:
             if time.perf_counter() < self._flush_guard_until:
-                return silent_frame(FRAME_SAMPLES)
+                generation = self.generation
+                return EgressFrame(silent_frame(FRAME_SAMPLES), generation, self._sequence(generation))
 
             generation = self.generation
+            sequence = self._sequence(generation)
             first_for_generation = generation not in self._first_audio_sent
-            # The first frame of a turn is the one the visitor is waiting for.
-            # Holding it for the 40 ms pre-buffer costs latency and buys nothing
-            # on a fresh generation, because a single 20 ms frame is already
-            # playable. Later frames keep the pre-buffer.
-            needed = FRAME_SAMPLES if first_for_generation else FRAME_SAMPLES * self._prebuffer_frames
-            enough = self.pending_samples() >= needed
-            if not enough and not self._residual.size:
+            finished = generation in self._finished
+            # Streaming keeps a pre-buffer; the first frame and the end of a
+            # turn do not. The first frame is what the visitor is waiting for;
+            # the last one must be flushed rather than stranded.
+            needed = 0 if finished else (
+                FRAME_SAMPLES if first_for_generation else FRAME_SAMPLES * self._prebuffer_frames
+            )
+            pending = self.pending_samples()
+            has_residual = bool(self._residual.size)
+            enough = pending >= needed if needed else (bool(self._chunks) or has_residual)
+            if finished and not self._chunks and not has_residual:
+                frame = silent_frame(FRAME_SAMPLES)
+            elif not enough and not has_residual:
                 # An underrun means the visitor heard playback stop mid-word.
                 # Before this generation has played anything there is nothing to
                 # stutter: the sender is waiting for the first voiced samples,
@@ -193,22 +318,27 @@ class AudioEgress:
                     self.underruns += 1
                 frame = silent_frame(FRAME_SAMPLES)
             else:
-                frame = self._next_chunk_frame()
+                frame = self._next_chunk_frame(flush=finished)
                 if frame.any() and first_for_generation:
                     self._first_audio_sent.add(generation)
                     if self.on_first_audio is not None:
                         with contextlib.suppress(Exception):
                             self.on_first_audio(generation)
 
+            if frame.any():
+                self._last_audio_seq[generation] = sequence
+
             now = time.perf_counter()
-            # Completion is decided on what is still queued *after* this frame:
-            # no whole frames left in the residual and nothing in the chunk
-            # queue means the transport has everything this turn will play.
-            if (
+            if finished:
+                # Only an acknowledged last frame completes the drain.
+                self._maybe_drained(generation)
+            elif (
                 generation in self._first_audio_sent
                 and not self._chunks
                 and len(self._residual) < FRAME_SAMPLES
             ):
+                # Legacy signal for callers that never call finish_generation
+                # (tests, short notices). Real turns take the ack path above.
                 self._drain_event(generation).set()
 
             if self._deadline is None:
@@ -227,7 +357,12 @@ class AudioEgress:
                     delay = 0.0
         if delay > 0:
             await asyncio.sleep(delay)
-        return frame
+        if self.generation != generation:
+            # An interrupt landed while this frame was pacing. It belongs to a
+            # generation the visitor must never hear again.
+            current = self.generation
+            return EgressFrame(silent_frame(FRAME_SAMPLES), current, self._sequence(current))
+        return EgressFrame(frame, generation, sequence)
 
     def drain_snapshot(self) -> dict:
         return {

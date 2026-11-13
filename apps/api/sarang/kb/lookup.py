@@ -485,3 +485,59 @@ def get_index(kb: KnowledgeBase | None = None) -> FactIndex:
 
 def lookup(query: str, kb: KnowledgeBase | None = None, limit: int = 3) -> LookupResult:
     return get_index(kb).lookup(query, limit=limit)
+
+
+# A pronoun carries no subject of its own, so it can only refer back to the
+# previous turn: "how does this system work?", "what were the numbers?", "why
+# was that?".
+PRONOUN_FOLLOWUP_RE = re.compile(
+    r"\b(it|that|this|those|these|same|the numbers)\b",
+    re.IGNORECASE,
+)
+
+# Continuation phrases add no topic either - anything topical is in the object
+# after them, which the router has already seen.
+CONTINUATION_FOLLOWUP_RE = re.compile(
+    r"\b(more about|tell me more|and the|why is that|why was that)\b",
+    re.IGNORECASE,
+)
+
+# "What about X?" / "How about X?" is ambiguous: it is a follow-up when X has
+# no evidence of its own ("what about the numbers?") and a new question when it
+# does ("what about QA-Forge?"). This is the one marker that needs the router's
+# opinion, because it is the one that introduces a subject.
+SUBJECT_SHIFT_RE = re.compile(r"\b(what about|how about)\b", re.IGNORECASE)
+
+
+def is_followup(
+    text: str,
+    previous: LookupResult | None,
+    current: LookupResult,
+) -> bool:
+    """Whether ``current`` should carry ``previous`` in front of it.
+
+    A pronoun or a continuation phrase means the question is about whatever the
+    last turn was about. The single exception is a subject-introducing phrase:
+    "what about QA-Forge?" names a block the router resolved confidently on its
+    own, and merging the previous evidence into it would bury the new subject
+    under the old one.
+    """
+    if previous is None or not previous.blocks:
+        return False
+    if SUBJECT_SHIFT_RE.search(text):
+        top = current.top
+        if current.confident and top is not None and top not in previous.blocks:
+            return False
+        return True
+    return bool(
+        PRONOUN_FOLLOWUP_RE.search(text) or CONTINUATION_FOLLOWUP_RE.search(text)
+    )
+
+
+__all__ = [
+    "LookupResult",
+    "is_followup",
+    "lookup",
+    "strip_discourse",
+    "tokenize",
+]

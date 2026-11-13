@@ -41,6 +41,8 @@ export interface SarangConfig {
   states: string[];
   broadcast_sample_rate: number;
   input_sample_rate: number;
+  /** "pcm16-v2" means /ws/audio frames carry a generation/sequence header. */
+  audio_format?: string;
   speculation_ms: number;
   filler: boolean;
   version: string;
@@ -96,6 +98,21 @@ export interface TurnMetrics {
   eos_to_first_audio_ms?: number;
   answer_first_audio_ms?: number;
   eos_to_answer_audio_ms?: number;
+  /** Why the turn is not a clean sample: llm_midstream, tts_partial, ... */
+  degraded?: string;
+  transport_first_frame_ms?: number;
+  eos_to_transport_first_frame_ms?: number;
+  /**
+   * Browser-reported deltas from the first voiced frame it received: until
+   * that audio was scheduled, and until the output device confirmed it. The
+   * server adds its own end-of-speech -> transport stamp, producing the
+   * `eos_to_client_*` values below on the one axis that matters.
+   */
+  client_scheduled_ms?: number;
+  client_audible_ms?: number;
+  eos_to_client_scheduled_ms?: number;
+  eos_to_client_audible_ms?: number;
+  audible_chars?: number;
   /**
    * Measured in the browser, not the server: this client's observed end of
    * speech → the moment the first answer audio is scheduled to be audible.

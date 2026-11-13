@@ -359,3 +359,26 @@ async def test_smallest_close_survives_a_cancelled_teardown(monkeypatch):
     await tts.prepare("hello")
 
     await tts.close()
+
+
+def test_stream_resampler_flush_returns_the_filter_tail():
+    import numpy as np
+    from sarang.audio.frames import StreamResampler
+
+    resampler = StreamResampler(22_050, 48_000)
+    first = resampler.process(np.ones(2_205, dtype=np.int16) * 1_000)
+    tail = resampler.flush()
+
+    assert first.size > 0
+    # soxr holds samples in its filter delay; a provider that signals completion
+    # must yield them or the last few milliseconds of every segment are lost.
+    assert tail.size > 0 or first.size >= 4_700
+
+
+def test_english_is_the_release_language_default():
+    from dataclasses import fields
+
+    from sarang.config import Settings
+
+    defaults = {field.name: field.default for field in fields(Settings)}
+    assert defaults["smallest_language"] == "en"

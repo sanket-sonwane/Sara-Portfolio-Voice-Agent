@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -31,7 +30,7 @@ import numpy as np
 
 from . import AGENT_NAME
 from .config import REPO_ROOT, Settings
-from .kb.lookup import LookupResult, lookup, strip_discourse
+from .kb.lookup import LookupResult, is_followup, lookup, strip_discourse
 from .kb.render import render_context, render_evidence, render_overview
 from .kb.retrieval import Chunk, search_docs
 from .llm import build_llm
@@ -50,9 +49,11 @@ from .schemas import EventType, SessionState
 from .segmenter import TextSegmenter, split_script
 from .session import Session, SessionRegistry
 from .speculative import Speculation, Speculator
+from .text_state import TurnText
 from .tools import ToolRunner
-from .tts import TTS, build_tts
+from .tts import TTS, TTSPartialError, build_tts
 from .tts.filler import FillerBank
+from .tts.lexicon import speakable
 
 log = logging.getLogger(__name__)
 
@@ -119,13 +120,25 @@ class OrderedSpeech:
         self.finished = False
         self._cancelled = False
         self.errors = 0
+        # Segment text and whether its synthesis completed. A segment is only
+        # committed once its audio has been handed to the egress; a provider
+        # failure halfway through leaves it uncommitted even though some audio
+        # was already queued.
+        self._texts: dict[int, str] = {}
+        self._complete: set[int] = set()
+        self.committed_segments: list[str] = []
+        # A segment whose provider failed after emitting audio. Its text is not
+        # committed, and no further segment is accepted: continuing after a
+        # mid-answer cut would produce a second, unrelated sentence after a gap.
+        self.degraded: str = ""
+        self.partial_segments: list[str] = []
 
     def start(self) -> None:
         if self._emitter is None:
             self._emitter = asyncio.create_task(self._emit_loop())
 
     def submit(self, text: str) -> None:
-        if not text.strip() or self.finished:
+        if not text.strip() or self.finished or self.degraded:
             return
         index = self._counter
         self._counter += 1
@@ -133,6 +146,9 @@ class OrderedSpeech:
         self._queues[index] = queue
         context_id = f"{self.turn_id}-{index}"
         self._contexts.append(context_id)
+        # Display text stays exactly as generated; only the synthesis input is
+        # rewritten by the pronunciation lexicon.
+        self._texts[index] = text
         if not self._submitted:
             self._submitted = True
             # The first segment reaching TTS is the end of segmentation. It used
@@ -141,7 +157,9 @@ class OrderedSpeech:
             # decides when speech can start.
             self.marks.exit_open("segment")
             self.marks.enter("tts_ttfa")
-        self._tasks[index] = asyncio.create_task(self._synthesize(index, text, context_id, queue))
+        self._tasks[index] = asyncio.create_task(
+            self._synthesize(index, speakable(text), context_id, queue)
+        )
         self._inbox.put_nowait(index)
 
     async def _synthesize(
@@ -151,6 +169,7 @@ class OrderedSpeech:
         context_id: str,
         queue: asyncio.Queue[np.ndarray | None],
     ) -> None:
+        complete = False
         try:
             async for span in self.tts.synthesize(text, context_id=context_id, final=True):
                 if span.pcm.size:
@@ -159,12 +178,25 @@ class OrderedSpeech:
                         self.marks.exit("tts_ttfa")
                         self.marks.mark_tts_first_span()
                     await queue.put(span.pcm)
+            complete = True
         except asyncio.CancelledError:
             raise
+        except TTSPartialError as error:
+            # The provider stopped after some audio. It gave no reliable text
+            # offset, so the segment cannot be completed honestly. Keep the
+            # audio that was emitted (it is already on its way) but leave the
+            # segment uncommitted and accept no more speech this turn.
+            self.errors += 1
+            self.degraded = "tts_partial"
+            self.marks.degraded = self.marks.degraded or "tts_partial"
+            self.partial_segments.append(self._texts.get(index, text))
+            log.warning("tts segment %s failed after audio: %s", index, error)
         except Exception as error:  # noqa: BLE001 - one bad segment must not kill the turn
             self.errors += 1
             log.warning("tts segment %s failed: %s", index, error)
         finally:
+            if complete:
+                self._complete.add(index)
             await queue.put(None)
 
     async def _emit_loop(self) -> None:
@@ -183,6 +215,10 @@ class OrderedSpeech:
                     self._first_chunk = True
                     self.marks.enter("egress")
                 self.egress.put(pcm, self.generation, self.turn_id)
+            if index in self._complete:
+                # Synthesis finished and its audio is with the egress, so this
+                # segment is committed text. Playback order, not provider order.
+                self.committed_segments.append(self._texts.get(index, ""))
 
     async def finish(self) -> None:
         if self.finished:
@@ -196,6 +232,12 @@ class OrderedSpeech:
             done = await asyncio.gather(*self._tasks.values(), return_exceptions=True)
             _ = done
             self._tasks.clear()
+        # No more chunks will ever be queued for this generation. Without this
+        # the egress keeps its streaming pre-buffer and can strand the final
+        # frame forever.
+        finish = getattr(self.egress, "finish_generation", None)
+        if finish is not None:
+            finish(self.generation)
 
     async def cancel(self) -> None:
         if getattr(self, "_cancelled", False):
@@ -242,18 +284,12 @@ class TurnRuntime:
     llm_started: float = 0.0
     spoken_words: int = 0
     truncated: bool = False
+    # generated / committed / audible are distinct on purpose. Only the last
+    # one is what the visitor heard.
+    text: TurnText = field(default_factory=TurnText)
 
 
 class Orchestrator:
-    # A follow-up ("what were the numbers?", "how does that approval work?")
-    # carries little topical vocabulary of its own. When the previous turn's
-    # evidence still answers it, that evidence must travel with the question.
-    FOLLOWUP_RE = re.compile(
-        r"\b(it|that|this|those|these|the numbers|more about|tell me more|"
-        r"what about|and the|same|there)\b",
-        re.I,
-    )
-
     def __init__(self, settings: Settings, registry: SessionRegistry | None = None) -> None:
         self.settings = settings
         self.registry = registry
@@ -444,9 +480,16 @@ class Orchestrator:
                 for segment in split_script(text):
                     speech.submit(segment)
                 await speech.finish()
+                committed = " ".join(speech.committed_segments).strip()
                 session.publish(
                     EventType.ASSISTANT_FINAL,
-                    {"text": text},
+                    {
+                        "text": committed or text,
+                        "generated_text": text,
+                        "committed_text": committed,
+                        "audible_text": "",
+                        "audible_chars": 0,
+                    },
                     turn_id=turn_id,
                     generation=generation,
                 )
@@ -473,6 +516,13 @@ class Orchestrator:
         if active is not None:
             active.cancelled = True
         session.cancel_active_turn()
+        # `turn_task` is not the only thing an interruption must stop: a voice
+        # turn that is still waiting for its ASR final owns `voice._final_task`,
+        # which used to survive the interrupt and start a second answer.
+        voice = session.voice
+        abandon = getattr(voice, "abandon_pending", None)
+        if abandon is not None:
+            abandon()
         speculation = session.speculation
         if speculation is not None:
             # A barge-in rewrites the conversation: an arm warmed for the
@@ -546,13 +596,19 @@ class Orchestrator:
         marks: TurnMarks | None = None,
         source: str = "text",
         turn_id: str | None = None,
+        input_seq: int | None = None,
     ) -> None:
         text = " ".join(text.split())
         if not text or session.closed:
             return
+        if input_seq is not None and input_seq != session.input_seq:
+            # A newer submission already owns the turn.
+            return
 
         async with session.turn_lock:
             if session.closed:
+                return
+            if input_seq is not None and input_seq != session.input_seq:
                 return
             started_turn, generation = session.begin_turn()
             turn_id = turn_id or started_turn
@@ -612,6 +668,59 @@ class Orchestrator:
             generation=runtime.generation,
         )
 
+    def note_audible(
+        self,
+        session: Session,
+        turn_id: str,
+        *,
+        chars: int | None = None,
+        text: str | None = None,
+        scheduled_ms: float | None = None,
+        audible_ms: float | None = None,
+    ) -> None:
+        """Apply the browser's playback report to the turn it belongs to.
+
+        This is the only path that may set ``audible``. A frame submitted to
+        the transport is not evidence that anything was heard: the visitor can
+        barge in while it is still queued.
+
+        The two timings are deltas from the first voiced frame the browser
+        received, so they need no shared clock with the server.
+        """
+        state = session.text_by_turn.get(turn_id)
+        if state is None:
+            return
+        if isinstance(chars, (int, float)) and not isinstance(chars, bool):
+            state.note_audible(chars=int(chars))
+        else:
+            state.note_audible(text)
+
+        marks = None
+        generation = session.generation
+        for gen, item in session.marks.items():
+            if item.turn_id == turn_id:
+                marks = item
+                generation = gen
+                break
+        if marks is None:
+            return
+        if isinstance(scheduled_ms, (int, float)) and not isinstance(scheduled_ms, bool):
+            marks.client_scheduled_ms = float(scheduled_ms)
+        if isinstance(audible_ms, (int, float)) and not isinstance(audible_ms, bool):
+            marks.client_audible_ms = float(audible_ms)
+        if marks.client_scheduled_ms is None and marks.client_audible_ms is None:
+            return
+        payload = marks.client_payload()
+        payload["turn_id"] = turn_id
+        payload["audible_chars"] = state.audible_chars
+        self.metrics.observe_client(payload)
+        session.publish(
+            EventType.METRICS_CLIENT,
+            payload,
+            turn_id=turn_id,
+            generation=generation,
+        )
+
     async def _run_turn(self, runtime: TurnRuntime, text: str, *, source: str) -> None:
         session = runtime.session
         generation = runtime.generation
@@ -636,12 +745,7 @@ class Orchestrator:
         speculation = speculator.consume(text) if speculator is not None else None
         previous = session.last_lookup
         result = speculation.result if speculation else lookup(text)
-        if (
-            previous is not None
-            and previous is not result
-            and previous.blocks
-            and self.FOLLOWUP_RE.search(text)
-        ):
+        if is_followup(text, previous, result):
             # "It"/"that"/"the numbers" refers to the previous subject. Lead with
             # the previous evidence, keep any specific current evidence, drop
             # generic skills blocks that would drown the subject.
@@ -756,9 +860,28 @@ class Orchestrator:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001
-            log.warning("llm %s failed, using local answerer: %s", self.settings.llm_provider, error)
-            session.notice("Language model unavailable; answering from the fact base.", "warning")
-            answer, tool_calls = await self._stream_fallback(runtime, text, result, chunks)
+            if runtime.first_token or runtime.segments:
+                # The visitor is already hearing this answer. Running the
+                # local fallback now would append a second, unrelated answer
+                # after the spoken prefix, and the transcript would claim a
+                # response that was never finished. Stop honestly.
+                runtime.truncated = True
+                runtime.marks.degraded = runtime.marks.degraded or "llm_midstream"
+                log.warning("llm failed mid-answer; stopping on the spoken prefix: %s", error)
+                session.notice(
+                    "The language model dropped mid-answer. I stopped rather than "
+                    "continue with a different answer.",
+                    "warning",
+                )
+                answer, tool_calls = runtime.answer, []
+            else:
+                log.warning(
+                    "llm %s failed, using local answerer: %s",
+                    self.settings.llm_provider,
+                    error,
+                )
+                session.notice("Language model unavailable; answering from the fact base.", "warning")
+                answer, tool_calls = await self._stream_fallback(runtime, text, result, chunks)
 
         if tool_calls and not tool_used:
             tool_used = True
@@ -800,20 +923,38 @@ class Orchestrator:
         if session.generation != generation:
             return
 
-        final_text = answer.strip()
-        if runtime.truncated:
-            # Publish what was actually said, so the transcript cannot claim a
-            # sentence the visitor never heard.
-            final_text = " ".join(runtime.segments).strip() or final_text
+        if runtime.speech.degraded:
+            # A provider that failed after emitting audio leaves the turn cut.
+            # The committed prefix is what may be claimed; the partial segment
+            # is not committed, because its spoken boundary is unknown.
+            runtime.truncated = True
+            runtime.marks.degraded = runtime.marks.degraded or runtime.speech.degraded
+
+        # Three separate answers to three different questions:
+        #   generated  - what the model wrote
+        #   committed  - what TTS finished and handed to egress
+        #   audible    - what the browser later confirms it played
+        runtime.text.generated = answer.strip()
+        runtime.text.committed_segments = list(runtime.speech.committed_segments)
+        final_text = runtime.text.transcript()
+        if runtime.truncated and not runtime.text.committed:
+            if runtime.speech.partial_segments:
+                # Audio for this sentence started but the provider stopped
+                # without alignment. Mark it as cut rather than claiming the
+                # whole sentence was spoken.
+                final_text = runtime.speech.partial_segments[-1].strip() + " …"
+            elif runtime.segments:
+                final_text = " ".join(runtime.segments).strip()
 
         if final_text:
             session.remember("assistant", final_text)
             session.publish(
                 EventType.ASSISTANT_FINAL,
-                {"text": final_text},
+                {"text": final_text, **runtime.text.payload()},
                 turn_id=runtime.turn_id,
                 generation=generation,
             )
+        session.text_by_turn[runtime.turn_id] = runtime.text
         self._record(runtime)
         if session.generation == generation and not session.closed:
             # Not LISTENING yet: the egress may still be playing the answer.

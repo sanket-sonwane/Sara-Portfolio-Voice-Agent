@@ -240,6 +240,9 @@ class CartesiaTTS(TTS):
                 converted = resampler.process(samples)
                 if converted.size:
                     yield AudioSpan(converted)
+            tail = resampler.flush()
+            if tail.size:
+                yield AudioSpan(tail)
         finally:
             self._channels.pop(context_id, None)
 

@@ -45,6 +45,7 @@ class EventType(StrEnum):
     ASSISTANT_DELTA = "assistant.delta"
     ASSISTANT_FINAL = "assistant.final"
     METRICS_TURN = "metrics.turn"
+    METRICS_CLIENT = "metrics.client"
     EVIDENCE = "evidence"
     EPOCH = "epoch"
     ERROR = "error"

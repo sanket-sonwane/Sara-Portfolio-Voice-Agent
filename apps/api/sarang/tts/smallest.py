@@ -252,6 +252,9 @@ class SmallestTTS(TTS):
                     yield AudioSpan(converted)
 
             if status == "complete":
+                tail = resampler.flush()
+                if tail.size:
+                    yield AudioSpan(tail)
                 return
 
     async def cancel(self, context_id: str) -> None:

@@ -114,6 +114,7 @@ def summarise(values: Sequence[float]) -> dict[str, float]:
         "n": len(values),
         "mean": round(statistics.fmean(values), 2),
         "p50": round(percentile(values, 50), 2),
+        "p90": round(percentile(values, 90), 2),
         "p95": round(percentile(values, 95), 2),
         "p99": round(percentile(values, 99), 2),
         "min": round(min(values), 2),
