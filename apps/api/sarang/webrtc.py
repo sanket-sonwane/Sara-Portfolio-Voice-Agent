@@ -56,6 +56,7 @@ def _build_egress_track_class():
 
             if self.session.closed:
                 raise MediaStreamError
+            generation = self.session.generation
             samples = await self.egress.next_frame()
             array = samples.reshape(1, FRAME_SAMPLES).astype(np.int16)
             frame = av.AudioFrame.from_ndarray(array, format="s16", layout="mono")
@@ -63,6 +64,13 @@ def _build_egress_track_class():
             frame.pts = self._pts
             frame.time_base = Fraction(1, 48_000)
             self._pts += FRAME_SAMPLES
+            marks = self.session.marks.get(generation)
+            if (
+                marks is not None
+                and marks.first_audio is not None
+                and marks.transport_first_frame is None
+            ):
+                marks.mark_transport_first_frame()
             return frame
 
     return EgressTrack

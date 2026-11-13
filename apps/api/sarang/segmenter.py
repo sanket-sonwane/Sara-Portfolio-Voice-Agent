@@ -88,8 +88,11 @@ class TextSegmenter:
     min_chars: int = 14
     max_chars: int = 150
     # Release the first speakable chunk quickly so TTS can start while the
-    # model is still generating; later segments prefer natural phrasing.
-    first_hold_ms: int = 120
+    # model is still generating; later segments prefer natural phrasing. The
+    # timer is a floor, not a target: with 3 words in hand the segment leaves as
+    # soon as this much time has passed since the first token. It was 120 ms,
+    # which was the whole of the measured "segmentation" stage.
+    first_hold_ms: int = 80
 
     _buffer: str = ""
     _first_released: bool = False

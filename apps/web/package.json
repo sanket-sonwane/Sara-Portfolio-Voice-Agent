@@ -6,7 +6,8 @@
   "description": "Drop-in React widget for the Sara voice agent",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "check:worklet": "node --check public/pcm-worklet.js",
+    "build": "node --check public/pcm-worklet.js && tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs"

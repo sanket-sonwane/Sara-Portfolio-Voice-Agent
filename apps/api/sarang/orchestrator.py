@@ -117,6 +117,7 @@ class OrderedSpeech:
         self._first_span = False
         self._first_chunk = False
         self.finished = False
+        self._cancelled = False
         self.errors = 0
 
     def start(self) -> None:
@@ -156,6 +157,7 @@ class OrderedSpeech:
                     if not self._first_span:
                         self._first_span = True
                         self.marks.exit("tts_ttfa")
+                        self.marks.mark_tts_first_span()
                     await queue.put(span.pcm)
         except asyncio.CancelledError:
             raise
@@ -180,7 +182,6 @@ class OrderedSpeech:
                 if not self._first_chunk:
                     self._first_chunk = True
                     self.marks.enter("egress")
-                    self.marks.mark_answer_first_audio()
                 self.egress.put(pcm, self.generation, self.turn_id)
 
     async def finish(self) -> None:
@@ -197,6 +198,9 @@ class OrderedSpeech:
             self._tasks.clear()
 
     async def cancel(self) -> None:
+        if getattr(self, "_cancelled", False):
+            return
+        self._cancelled = True
         self.finished = True
         for task in self._tasks.values():
             task.cancel()
@@ -214,9 +218,12 @@ class OrderedSpeech:
         cancel = getattr(client, "cancel", None)
         if cancel is None:
             return
-        for context_id in self._contexts:
-            with contextlib.suppress(Exception):
-                await cancel(context_id)
+        # Concurrently: one segment per context, and a provider that answers
+        # slowly must not make the next of N cancellations queue behind it.
+        await asyncio.gather(
+            *(cancel(context_id) for context_id in self._contexts),
+            return_exceptions=True,
+        )
 
 
 @dataclass
@@ -264,7 +271,12 @@ class Orchestrator:
         self.filler_after_s = max(0.35, settings.speculative_ms / 1000.0 or 0.6)
         self.ready = False
         self.started_at = time.time()
+        self.detector = "energy"
+        self.detector_silence_ms = 800
         self._active_speech: set[OrderedSpeech] = set()
+        # Interrupt cleanup runs in the background: barge-in must not wait for
+        # provider cancels. The set exists only so shutdown can drain them.
+        self._cleanup_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ setup
 
@@ -291,12 +303,31 @@ class Orchestrator:
             self.settings.retrieval_backend = "bm25-local"
         self.ready = True
         self.filler.warm_background()
+        # Load the detector once, at startup, so a missing model or a bad hash
+        # is a startup warning rather than a silent per-connection fallback, and
+        # so the effective window is on the record before the first question.
+        from .audio.vad import VadConfig, build_vad
+
+        probe = build_vad(
+            VadConfig(
+                silence_ms=self.settings.endpoint_silence_ms,
+                min_speech_ms=self.settings.endpoint_min_speech_ms,
+                hangover_ms=self.settings.endpoint_hangover_ms,
+                silero_threshold=self.settings.vad_silero_threshold,
+            ),
+            mode=self.settings.vad_mode,
+            model_path=self.settings.vad_silero_model or None,
+        )
+        self.detector = probe.detector
+        self.detector_silence_ms = probe.config.silence_ms
         log.info(
-            "sarang ready profile=%s asr=%s llm=%s tts=%s blocks=%d",
+            "sarang ready profile=%s asr=%s llm=%s tts=%s vad=%s/%dms blocks=%d",
             self.settings.profile.name,
             self.settings.asr_provider,
             self.settings.llm_provider,
             self.settings.tts_provider,
+            self.detector,
+            self.detector_silence_ms,
             len(kb.blocks),
         )
 
@@ -304,6 +335,11 @@ class Orchestrator:
         self.ready = False
         if self.registry is not None:
             await self.registry.close_all()
+        for task in list(self._cleanup_tasks):
+            task.cancel()
+        if self._cleanup_tasks:
+            await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+            self._cleanup_tasks.clear()
         for speech in list(self._active_speech):
             await speech.cancel()
         await self.tts.close()
@@ -329,6 +365,35 @@ class Orchestrator:
             session, generation
         )
         return session
+
+    def _watch_playback(self, session: Session, generation: int) -> None:
+        """Flip back to LISTENING when the egress has no audio left.
+
+        Synthesis finishing is not playback finishing: the egress queue can
+        still hold the rest of the answer. Transitioning early made both
+        barge-in paths stop listening while the visitor was still hearing
+        speech. This runs as its own task so the turn does not hold
+        ``turn_lock`` for the duration of the answer.
+        """
+        task = asyncio.create_task(self._await_playback(session, generation))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    async def _await_playback(self, session: Session, generation: int) -> None:
+        try:
+            await session.egress.wait_drained(generation, timeout=30.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - lifecycle must not raise into a task
+            log.debug("playback drain wait failed", exc_info=True)
+        if session.closed or session.generation != generation:
+            return
+        if session.state in {
+            SessionState.SPEAKING,
+            SessionState.THINKING,
+            SessionState.TOOL_WORKING,
+        }:
+            session.set_state(SessionState.LISTENING)
 
     def _on_first_audio(self, session: Session, generation: int) -> None:
         marks = session.marks.get(generation)
@@ -388,11 +453,18 @@ class Orchestrator:
             finally:
                 self._active_speech.discard(speech)
                 if session.generation == generation and not session.closed:
-                    session.set_state(SessionState.LISTENING)
+                    self._watch_playback(session, generation)
 
-    async def interrupt(self, session: Session, reason: str = "barge-in") -> None:
-        if session.closed:
-            return
+    def _interrupt_now(self, session: Session, reason: str) -> int:
+        """The part of an interruption that must not wait for anybody.
+
+        Generation bump, egress gate, turn cancellation and the EPOCH event are
+        all synchronous. The browser can flush on EPOCH immediately, and every
+        frame from the old generation is rejected from this instant. Only
+        provider cleanup (TTS ``cancel`` calls) is asynchronous, and it used to
+        hold EPOCH back - which made barge-in feel a full provider round-trip
+        slower than it was.
+        """
         session.interruptions += 1
         session.generation += 1
         generation = session.generation
@@ -406,15 +478,56 @@ class Orchestrator:
             # A barge-in rewrites the conversation: an arm warmed for the
             # interrupted turn must never be adopted by the next one.
             speculation.reset()
-        for speech in list(self._active_speech):
-            await speech.cancel()
         session.publish(
             EventType.EPOCH,
             {"generation": generation, "reason": reason},
             generation=generation,
         )
         session.set_state(SessionState.INTERRUPTED, reason)
+        return generation
+
+    async def _cancel_active_speech(self) -> None:
+        """Cancel every active speech object concurrently, with a bound.
+
+        Sequential cancellation meant an interruption cost the sum of every
+        provider's cancel latency. The gather is bounded because a wedged
+        provider must not keep the old generation's tasks alive either.
+        """
+        speeches = list(self._active_speech)
+        if not speeches:
+            return
+        with contextlib.suppress(TimeoutError, Exception):
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(speech.cancel() for speech in speeches),
+                    return_exceptions=True,
+                ),
+                timeout=1.0,
+            )
+
+    async def interrupt(self, session: Session, reason: str = "barge-in") -> None:
+        if session.closed:
+            return
+        generation = self._interrupt_now(session, reason)
+        await self._cancel_active_speech()
         asyncio.create_task(self._resume_listening(session, generation))
+
+    def interrupt_soon(self, session: Session, reason: str = "barge-in") -> None:
+        """Interrupt from the audio ingest path without awaiting cleanup.
+
+        ``_begin_utterance`` runs inside ``push``: every millisecond spent here
+        is microphone audio that is not yet in the recogniser.
+        """
+        if session.closed:
+            return
+        generation = self._interrupt_now(session, reason)
+        cleanup = asyncio.create_task(self._finish_interrupt(session, generation))
+        self._cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._cleanup_tasks.discard)
+
+    async def _finish_interrupt(self, session: Session, generation: int) -> None:
+        await self._cancel_active_speech()
+        await self._resume_listening(session, generation)
 
     async def _resume_listening(self, session: Session, generation: int) -> None:
         await asyncio.sleep(0.12)
@@ -471,8 +584,12 @@ class Orchestrator:
                     # Preserve what was actually said so a follow-up can refer
                     # to it, while marking that the sentence was cut off.
                     session.remember("assistant", runtime.answer.strip() + " …")
-                await speech.cancel()
                 self._record(runtime)
+                # Provider cleanup runs in the background: awaiting it here let
+                # a slow TTS cancel keep turn_lock held, delaying the next turn.
+                cleanup = asyncio.create_task(speech.cancel())
+                self._cleanup_tasks.add(cleanup)
+                cleanup.add_done_callback(self._cleanup_tasks.discard)
                 raise
             except Exception as error:  # noqa: BLE001
                 log.exception("turn failed: %s", error)
@@ -699,7 +816,8 @@ class Orchestrator:
             )
         self._record(runtime)
         if session.generation == generation and not session.closed:
-            session.set_state(SessionState.LISTENING)
+            # Not LISTENING yet: the egress may still be playing the answer.
+            self._watch_playback(session, generation)
 
     # ------------------------------------------------------------- streaming
 

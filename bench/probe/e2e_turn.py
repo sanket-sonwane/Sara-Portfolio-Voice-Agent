@@ -10,10 +10,16 @@ Three totals are reported, because they answer different questions:
 
 * **client total** — last speech frame sent -> first non-silent frame received.
   This is what the visitor experiences, and it includes the endpointing silence.
-* **first audible** (``eos_to_first_audio_ms``) — VAD end-of-speech -> first
-  audio. May be a cached acknowledgement on a slow turn.
+* **first frame on the wire** (``eos_to_transport_first_frame_ms``) — the first
+  frame that actually left the process. This is the honest "playback started"
+  stamp on the server side.
 * **first answer audio** (``eos_to_answer_audio_ms``) — VAD end-of-speech ->
   first real answer audio. Excludes fillers.
+
+The payload also separates the two events that used to share one name: the
+first synthesized span (``eos_to_tts_first_span_ms``) and the first frame the
+egress selected (``eos_to_egress_first_frame_ms``). A fast provider is not a
+fast egress, and neither is proof the visitor heard anything.
 
 The component breakdown comes from ``metrics.turn`` and is measured on the
 server: ASR finalisation, lookup, context assembly, LLM TTFT, first-segment
@@ -261,6 +267,8 @@ async def run_one(base_url: str, samples: np.ndarray) -> dict[str, Any]:
 
 def _stage_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     stages = [
+        "endpoint",
+        "asr_finalize",
         "asr_final",
         "lookup",
         "context",
@@ -307,7 +315,21 @@ def _totals(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             lambda r: r["client_total_ms"],
         ),
         (
-            "server: EOS -> first audible",
+            "server: EOS -> first synthesized span",
+            lambda r: r["metrics"].get("eos_to_tts_first_span_ms"),
+        ),
+        (
+            "server: EOS -> egress first frame",
+            lambda r: r["metrics"].get("eos_to_egress_first_frame_ms"),
+        ),
+        (
+            "server: EOS -> first frame on the wire",
+            lambda r: r["metrics"].get("eos_to_transport_first_frame_ms"),
+        ),
+        (
+            # Deprecated name: it means "the egress selected a frame", not
+            # "the visitor heard it". Kept so old baselines remain comparable.
+            "server: EOS -> first audible (legacy egress stamp)",
             lambda r: r["metrics"].get("eos_to_first_audio_ms"),
         ),
         (
@@ -387,7 +409,13 @@ async def run(args: argparse.Namespace) -> int:
             for key in ("client_total_ms",):
                 if run_result.get(key) is not None:
                     result.add(key, float(run_result[key]))
-            for key in ("eos_to_first_audio_ms", "eos_to_answer_audio_ms"):
+            for key in (
+                "eos_to_tts_first_span_ms",
+                "eos_to_egress_first_frame_ms",
+                "eos_to_transport_first_frame_ms",
+                "eos_to_first_audio_ms",
+                "eos_to_answer_audio_ms",
+            ):
                 if run_result["metrics"].get(key) is not None:
                     result.add(key, float(run_result["metrics"][key]))
         result.metrics["transcripts"] = [run_result["transcript"] for run_result in runs]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 from sarang.audio.frames import FRAME_SAMPLES
 from sarang.audio.shaper import AudioEgress
@@ -243,3 +245,67 @@ async def test_drain_snapshot_reports_pending_ms():
     snapshot = egress.drain_snapshot()
     assert snapshot["pending_ms"] == 200.0
     assert snapshot["generation"] == 1
+
+
+# --------------------------------------------------------- playback lifecycle
+
+
+async def test_wait_drained_holds_until_the_last_frame_is_sent():
+    """Synthesis finishing is not playback finishing."""
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(pcm(FRAME_SAMPLES * 3), 1, "trn_1")
+
+    waiter = asyncio.create_task(egress.wait_drained(1, timeout=2.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    for _ in range(3):
+        await egress.next_frame()
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+
+async def test_wait_drained_is_immediate_without_audio_or_for_a_stale_generation():
+    egress = AudioEgress()
+    egress.set_generation(2)
+    assert await egress.wait_drained(2, timeout=0.01) is True
+    # A generation that has already been replaced is not playing out.
+    egress.put(pcm(FRAME_SAMPLES * 4), 2, "trn_2")
+    assert await egress.wait_drained(1, timeout=0.01) is True
+
+
+async def test_interrupt_releases_a_playback_waiter():
+    egress = AudioEgress(flush_guard_ms=10)
+    egress.set_generation(1)
+    egress.put(pcm(FRAME_SAMPLES * 50), 1, "trn_1")
+
+    waiter = asyncio.create_task(egress.wait_drained(1, timeout=5.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    egress.interrupt(2)
+
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+    # The queue is empty and the guard frame is silent: the old answer stops
+    # immediately rather than being played out for the next second.
+    assert egress.pending_samples() == 0
+    assert not (await egress.next_frame()).any()
+
+
+async def test_new_audio_after_a_drain_clears_the_completion_signal():
+    egress = AudioEgress()
+    egress.set_generation(1)
+    egress.put(pcm(FRAME_SAMPLES), 1, "trn_1")
+    await egress.next_frame()
+    assert await egress.wait_drained(1, timeout=0.01) is True
+
+    # More of the same answer arrived (a later TTS span). Playback is not over,
+    # so the waiter must block again until it is actually drained.
+    egress.put(pcm(FRAME_SAMPLES * 2), 1, "trn_1")
+    waiter = asyncio.create_task(egress.wait_drained(1, timeout=1.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    await egress.next_frame()
+    await egress.next_frame()
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True

@@ -31,7 +31,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -40,10 +39,11 @@ from pathlib import Path
 import numpy as np
 
 from .asr import build_asr
+from .asr.base import ASREvent
 from .asr.normalize import normalize_transcript
 from .audio.frames import frame_bytes, to_int16
-from .audio.vad import Vad, VadConfig
-from .kb.lookup import strip_discourse, tokenize
+from .audio.vad import VadConfig, build_vad
+from .kb.lookup import strip_discourse
 from .metrics import TurnMarks
 from .orchestrator import Orchestrator
 from .schemas import EventType, SessionState
@@ -64,6 +64,16 @@ class _Utterance:
     final: str = ""
     event: asyncio.Event = field(default_factory=asyncio.Event)
     pcm: bytearray = field(default_factory=bytearray)
+    # The index the provider used for this turn, once one of its events has
+    # been seen. ``index - 1`` is only a provisional guess: nothing in the
+    # protocol guarantees the provider is zero-based or that it counts every
+    # ``speech_start`` we sent.
+    provider_index: int | None = None
+    closed: bool = False
+    # The visitor began a new utterance before this one's final arrived. The
+    # transcript is still dumped for diagnostics, but it must not start an
+    # answer over the top of the new question.
+    superseded: bool = False
 
 
 class UtteranceLoop:
@@ -71,17 +81,22 @@ class UtteranceLoop:
         self.orchestrator = orchestrator
         self.session = session
         settings = session.settings
-        self.vad = Vad(
+        self.vad = build_vad(
             VadConfig(
                 threshold_dbfs=settings.vad_threshold_dbfs,
                 adaptive_margin_db=settings.vad_adaptive_margin_db,
                 silence_ms=settings.endpoint_silence_ms,
                 min_speech_ms=settings.endpoint_min_speech_ms,
                 hangover_ms=settings.endpoint_hangover_ms,
-            )
+                silero_threshold=settings.vad_silero_threshold,
+            ),
+            mode=settings.vad_mode,
+            model_path=settings.vad_silero_model or None,
         )
         self.asr = None
         self.reader: asyncio.Task | None = None
+        self._asr_lock = asyncio.Lock()
+        self._rewarm_task: asyncio.Task | None = None
         self.marks: TurnMarks | None = None
         self.closed = False
         self._warned = False
@@ -90,7 +105,16 @@ class UtteranceLoop:
         self._final_task: asyncio.Task | None = None
         self._utterance = 0
         self.current: _Utterance | None = None
-        self._pending: dict[int, _Utterance] = {}
+        # Explicit routing. Provider events carry an index we did not issue, so
+        # the map is built as events arrive and an event that cannot be placed
+        # unambiguously is dropped rather than applied to ``current``.
+        self._open: list[_Utterance] = []
+        self._by_provider: dict[int, _Utterance] = {}
+        self._closed_indices: deque[int] = deque(maxlen=64)
+        # Speculation runs off this task, never on the ASR reader: a tier-2
+        # lookup inside the reader delayed ``transcript.final`` by up to 500 ms.
+        self._note_text: str | None = None
+        self._note_task: asyncio.Task | None = None
         # Pre-roll: only collected while no utterance is being captured, so it
         # holds the most recent 800 ms of silence and the first syllable of the
         # next question. It is replayed once, then cleared.
@@ -99,7 +123,6 @@ class UtteranceLoop:
         self._ring_limit = max(3_200, settings.endpoint_preroll_ms * _BYTES_PER_MS)
         self._dump_dir = Path(settings.asr_dump_dir) if settings.asr_dump_dir else None
         self._final_timeout = settings.asr_final_timeout_s
-        self._early_silence_ms = settings.endpoint_early_silence_ms
         # Media clock and the moment the closing silence window opened. The
         # endpoint cost is measured in *media* time, not wall clock: a test (or
         # a burst replay) pushes frames faster than real time, and a wall-clock
@@ -110,7 +133,6 @@ class UtteranceLoop:
         # A stable, terminally-punctuated partial is the only evidence strong
         # enough to justify closing the turn before the full silence window.
         self._partial_changed_at = 0.0
-        self._terminal_re = re.compile(r'[.!?…]["\')\]]?\s*$')
 
     # ------------------------------------------------------------------ input
 
@@ -168,26 +190,20 @@ class UtteranceLoop:
                     {"text": utterance.latest, "source": "voice"},
                 )
 
-        if (
-            not update.speech_ended
-            and self._capturing
-            and not self._finalizing
-            and self._silence_onset is not None
-        ):
-            silence_ms = self._media_ms - self._silence_onset
-            if self._can_close_early(silence_ms):
-                # The recogniser already has a complete sentence and the
-                # visitor has been silent long enough that this is very
-                # unlikely to be a mid-thought pause. Close now; the VAD's
-                # own 800 ms window would have reached the same conclusion
-                # later. endpoint_ms is the observed silence, not the
-                # configured ceiling.
-                self._capturing = False
-                self._start_finalize(max(0.0, silence_ms))
-
         if update.speech_ended and self._capturing:
+            # The only place capture closes. Content-based early closing was
+            # removed: it closed at 120 ms of silence while the detector was
+            # still ``active``, and the VAD cannot re-fire ``speech_started``
+            # for the same utterance, so every frame after the pause was
+            # dropped (or replayed into the next question). Measured on
+            # bench/audio/question-16k.wav, whose only internal pause is
+            # 460 ms - see config.endpoint_early_silence_ms.
             self._capturing = False
-            self._start_finalize(endpoint_ms)
+            # The window is measured in media time; the turn origin is where it
+            # started. Stamping it here (not inside the finalize task) is what
+            # keeps the endpoint out of the ``asr_final`` number.
+            decision_at = time.perf_counter()
+            self._start_finalize(endpoint_ms, decision_at - endpoint_ms / 1000.0)
 
     def _remember(self, frame: bytes) -> None:
         self._ring.append(frame)
@@ -196,73 +212,18 @@ class UtteranceLoop:
             dropped = self._ring.popleft()
             self._ring_bytes -= len(dropped)
 
-    def _can_close_early(self, silence_ms: float) -> bool:
-        """True only when a shorter silence is safe evidence the turn is over.
-
-        A partial can look finished during a mid-sentence pause (ADR 0003
-        records a 460 ms pause inside a correctly-spoken question where the
-        partial was already punctuated and stable). The guard therefore
-        requires all of: enough observed silence, a terminally-punctuated
-        partial, and a partial that has not changed for a meaningful stretch -
-        so the recogniser is not still revising it. Anything uncertain keeps
-        the full silence window.
-
-        ``endpoint_early_silence_ms == 0`` means "no added timer floor":
-        close as soon as content/stability evidence is strong once real
-        silence is observed, instead of imposing a fixed extra pause.
-        Negative disables this path.
-
-        Filler-led fragments ("However, I mean.", "Actually.") can be
-        punctuated and stable while the visitor is only pausing before the
-        real question; closing on them would pass only the preamble to the
-        model. A bare period/ellipsis therefore needs substantive content,
-        while '?'/'!' are strong end-of-utterance signals on their own.
-        """
-        early = self._early_silence_ms
-        if early < 0:
-            return False
-        # A configured floor of 0 removes the *added* timer wait, but we still
-        # require a small amount of observed silence so we never close on a
-        # transient non-speech blip while the user is still forming words.
-        min_silence = float(early) if early > 0 else 120.0
-        if silence_ms < min_silence:
-            return False
-        utterance = self.current
-        if utterance is None:
-            return False
-        text = (utterance.latest or "").strip()
-        match = self._terminal_re.search(text)
-        if not text or match is None:
-            return False
-        # Stable since at least 300 ms of media time ago. This rules out a
-        # partial that just acquired its final punctuation on this frame.
-        # With no added timer wait requested, require more stability so a
-        # freshly-punctuated partial has time to settle/revise.
-        stable_ms = 300.0 if early > 0 else 500.0
-        if self._partial_changed_at > self._media_ms - stable_ms:
-            return False
-
-        terminal = match.group(0).lstrip()
-        # Question/exclamation marks are strong completion signals. A period
-        # or ellipsis is ambiguous: disfluencies and trailing fillers are
-        # often punctuated as sentences, so require real content.
-        if terminal.startswith("?") or terminal.startswith("!"):
-            return True
-
-        stripped = strip_discourse(text)
-        # A fragment that is only discourse/fillers ("I mean.", "Actually.")
-        # must never end the turn early - the visitor is likely about to ask.
-        if not stripped:
-            return False
-        topical = tokenize(stripped)
-        if not topical and len(stripped.split()) <= 4:
-            return False
-        return True
-
     async def _begin_utterance(self) -> None:
         session = self.session
-        if session.state == SessionState.SPEAKING:
-            await self.orchestrator.interrupt(session, "barge-in")
+        # Any state where a turn is actively producing something is a barge-in:
+        # speaking audio, waiting on the model, or running a tool. Only the
+        # synchronous half runs here (generation gate + EPOCH); provider cleanup
+        # is scheduled, because this coroutine is inside the microphone path.
+        if session.state in (
+            SessionState.SPEAKING,
+            SessionState.THINKING,
+            SessionState.TOOL_WORKING,
+        ):
+            self.orchestrator.interrupt_soon(session, "barge-in")
 
         # Speculation belongs to one utterance. An arm warmed for the
         # previous question must never be adoptable for this one; the gates
@@ -272,38 +233,62 @@ class UtteranceLoop:
             speculator.reset()
 
         if self._finalizing and self._final_task is not None:
-            # A previous turn is still waiting for its final. Give it a short
-            # window; if it is stuck, abandon it rather than swallow new speech.
-            with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
-                await asyncio.wait_for(asyncio.shield(self._final_task), timeout=1.5)
-            if self._finalizing and self._final_task is not None:
-                self._final_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self._final_task
-                self._final_task = None
-                self._finalizing = False
+            # A previous turn is still waiting for its final. This is the
+            # barge-in case: the visitor is already talking over it. Waiting
+            # here - even 250 ms - stalls the microphone at the exact moment
+            # speech resumes, so the old turn is abandoned synchronously and
+            # its cleanup runs in its own task.
+            if self.current is not None:
+                # Whatever that turn produces, it must not start an answer now.
+                self.current.superseded = True
+            self._abandon_finalize()
 
-        session.set_state(SessionState.LISTENING, "Listening")
+        session.set_state(SessionState.USER_SPEAKING, "Hearing you")
         self._silence_onset = None
 
         if not await self._ensure_asr():
+            # Without a reset the detector stays ``active`` and cannot emit
+            # ``speech_started`` again, so the rest of this utterance (and the
+            # next one, if the visitor keeps talking) would be ignored.
+            self.vad.reset()
+            session.set_state(SessionState.LISTENING, "Listening")
             return
 
         self._utterance += 1
         utterance = _Utterance(index=self._utterance)
         self.current = utterance
-        # Sarvam's utterance counter is zero-based for the session.
-        self._pending[utterance.index - 1] = utterance
+        self._open.append(utterance)
+        # Provisional: Sarvam's counter is zero-based *in the dumps we have*,
+        # but the first event rebinds this if the provider disagrees.
+        self._by_provider[utterance.index - 1] = utterance
         self._capturing = True
         self._partial_changed_at = self._media_ms
 
-        await self.asr.begin_utterance()
+        try:
+            armed = await self.asr.begin_utterance()
+        except Exception:  # noqa: BLE001 - a dead socket must not freeze capture
+            log.warning("asr begin_utterance failed", exc_info=True)
+            armed = False
+        if armed is False:
+            # The provider socket is not armed. Do not wait for it inside the
+            # ingest path: abandon this onset and let the detector fire again.
+            log.warning("asr not ready; abandoning utterance onset")
+            self._capturing = False
+            self._close_utterance(utterance)
+            self.vad.reset()
+            session.set_state(SessionState.LISTENING, "Listening")
+            return
+
         preroll = list(self._ring)
         self._ring.clear()
         self._ring_bytes = 0
-        for buffered in preroll:
-            utterance.pcm.extend(buffered)
-            await self.asr.push(buffered)
+        if preroll:
+            # One send for the whole ring: the recogniser buffers and batches
+            # internally, and 15 awaited sends sat in the microphone path for no
+            # reason.
+            for buffered in preroll:
+                utterance.pcm.extend(buffered)
+            await self.asr.push(b"".join(preroll))
 
     # -------------------------------------------------------------------- ASR
 
@@ -320,6 +305,10 @@ class UtteranceLoop:
             await self._ensure_asr()
 
     async def _ensure_asr(self) -> bool:
+        async with self._asr_lock:
+            return await self._ensure_asr_locked()
+
+    async def _ensure_asr_locked(self) -> bool:
         if self.asr is not None and getattr(self.asr, "alive", True):
             return True
         if self.asr is not None:
@@ -340,7 +329,7 @@ class UtteranceLoop:
         connect = getattr(asr, "connect", None)
         if connect is not None:
             try:
-                await asyncio.wait_for(connect(), timeout=4.0)
+                await asyncio.wait_for(connect(), timeout=9.0)
             except Exception as error:  # noqa: BLE001
                 log.warning("asr connect failed: %s", error)
                 await asr.close()
@@ -356,13 +345,89 @@ class UtteranceLoop:
         self.reader = asyncio.create_task(self._read_asr())
         return True
 
+    def _utterance_for(self, event: ASREvent) -> _Utterance | None:
+        """Map a provider event onto the turn it belongs to, or drop it.
+
+        The provider's ``utterance_idx`` is not ours: nothing guarantees it is
+        zero-based, that it counts every ``speech_start``, or that it cannot
+        arrive late. The old code fell back to ``self.current`` on a miss,
+        which could apply the previous question's final to the next turn and
+        release it early with the wrong text. Here a miss is only resolved when
+        exactly one turn is open; otherwise the event is dropped and logged.
+        """
+        found = self._by_provider.get(event.utterance)
+        if found is not None and not found.closed:
+            return found
+        if event.utterance in self._closed_indices:
+            log.debug(
+                "asr %s for closed turn idx=%s; ignoring",
+                "final" if event.final else "partial",
+                event.utterance,
+            )
+            return None
+        open_turns = [item for item in self._open if not item.closed]
+        if len(open_turns) == 1:
+            utterance = open_turns[0]
+            utterance.provider_index = event.utterance
+            self._by_provider[event.utterance] = utterance
+            return utterance
+        log.warning(
+            "asr %s for unplaceable utterance_idx=%s (open turns=%d); dropping",
+            "final" if event.final else "partial",
+            event.utterance,
+            len(open_turns),
+        )
+        return None
+
+    def _close_utterance(self, utterance: _Utterance) -> None:
+        utterance.closed = True
+        for key, value in list(self._by_provider.items()):
+            if value is utterance:
+                self._closed_indices.append(key)
+                del self._by_provider[key]
+        with contextlib.suppress(ValueError):
+            self._open.remove(utterance)
+        if self.current is utterance:
+            self.current = None
+
+    def _schedule_note(self, text: str) -> None:
+        """Warm speculation off the ASR reader.
+
+        ``Speculator.note`` can run a tier-2 retrieval with a 500 ms timeout.
+        Awaiting it inside the reader delayed delivery of ``transcript.final``
+        by exactly that much, which then showed up as ``asr_final``. This
+        coalesces bursts: while one note is running, only the newest partial
+        is kept.
+        """
+        if self.session.speculation is None:
+            return
+        self._note_text = text
+        if self._note_task is None or self._note_task.done():
+            self._note_task = asyncio.create_task(self._drain_notes())
+
+    async def _drain_notes(self) -> None:
+        while True:
+            text = self._note_text
+            self._note_text = None
+            if text is None:
+                return
+            speculator = self.session.speculation
+            if speculator is None:
+                return
+            try:
+                await speculator.note(strip_discourse(text))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - speculation must never break a turn
+                log.debug("speculation note failed", exc_info=True)
+
     async def _read_asr(self) -> None:
         assert self.asr is not None
         try:
             async for event in self.asr.events():
                 if not event.text:
                     continue
-                utterance = self._pending.get(event.utterance) or self.current
+                utterance = self._utterance_for(event)
                 if utterance is None:
                     continue
                 if event.final:
@@ -379,22 +444,26 @@ class UtteranceLoop:
                         EventType.TRANSCRIPT_PARTIAL,
                         {"text": utterance.latest, "source": "voice", "final": False},
                     )
-                    # Warm the lookup (and the speculative arm) from the
-                    # question itself, never from the discourse wrapped
-                    # around it - the same strip the turn engine applies.
-                    # Awaited inline: it is an in-memory lookup, and keeping
-                    # it in the reader preserves partial ordering.
-                    speculator = self.session.speculation
-                    if speculator is not None:
-                        await speculator.note(strip_discourse(utterance.latest))
+                    self._schedule_note(utterance.latest)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001
             log.warning("asr stream failed: %s", error)
         finally:
             # Unblock any turn waiting on a final that will never arrive.
-            for utterance in list(self._pending.values()):
+            for utterance in list(self._open):
                 utterance.event.set()
+            # Reconnect in the background, not on the next ``push``: rebuilding
+            # the socket can take seconds, and the ingest path must never pay
+            # it while the visitor is already talking.
+            if not self.closed:
+                self._rewarm_task = asyncio.create_task(self._rewarm_asr())
+
+    async def _rewarm_asr(self) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.sleep(0.2)
+            if not self.closed:
+                await self._ensure_asr()
 
     async def _close_asr(self) -> None:
         if self.reader is not None:
@@ -409,42 +478,69 @@ class UtteranceLoop:
 
     # --------------------------------------------------------------- finalize
 
-    def _start_finalize(self, endpoint_ms: float = 0.0) -> None:
+    def _abandon_finalize(self) -> None:
+        """Stop waiting for a previous turn's final without blocking the mic.
+
+        The task is cancelled, not awaited: its ``finally`` closes the
+        utterance. Nothing it produces can run a turn because the utterance was
+        already marked ``superseded``.
+        """
+        task, self._final_task = self._final_task, None
+        self._finalizing = False
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _start_finalize(self, endpoint_ms: float = 0.0, origin: float | None = None) -> None:
         if self._finalizing:
             return
         self._finalizing = True
-        self._final_task = asyncio.create_task(self._finalize(endpoint_ms))
-
-    async def _finalize(self, endpoint_ms: float = 0.0) -> None:
-        session = self.session
+        # Capture the turn now: by the time the coroutine runs, ``current`` may
+        # already be the next utterance (barge-in), and finalizing that one with
+        # this turn's audio would be the exact misroute this loop just fixed.
         utterance = self.current
-        marks = TurnMarks("pending")
-        marks.mark_end_of_speech()
+        self._final_task = asyncio.create_task(
+            self._finalize(endpoint_ms, origin, utterance)
+        )
+
+    async def _finalize(
+        self,
+        endpoint_ms: float = 0.0,
+        origin: float | None = None,
+        utterance: _Utterance | None = None,
+    ) -> None:
+        session = self.session
+        # A voice turn is measured from the last speech frame, not from the
+        # moment this coroutine was scheduled: the gap between the two is the
+        # endpoint window, and it used to be charged to ASR.
+        marks = TurnMarks("pending", origin=origin or time.perf_counter())
+        marks.mark_end_of_speech(marks.origin)
         marks.mark_endpoint(endpoint_ms)
         marks.source = "voice"
-        session.set_state(SessionState.TRANSCRIBING, "Transcribing")
+        if self.current is utterance:
+            session.set_state(SessionState.TRANSCRIBING, "Transcribing")
         try:
             if utterance is None:
                 return
-            marks.enter("asr_final")
             # Overlap: while waiting for the provider's final transcript,
             # warm/adopt speculation from the latest partial so lookup and a
             # speculative LLM arm can run during ASR finalization instead of
             # after it. If the final differs, consume()'s gates refuse it.
+            # Debounced and off the reader: see ``_schedule_note``.
             if utterance.latest:
-                spec = self.session.speculation
-                if spec is not None:
-                    asyncio.create_task(
-                        spec.note(strip_discourse(utterance.latest))
-                    )
+                self._schedule_note(utterance.latest)
             if self.asr is not None:
+                marks.enter("asr_finalize")
                 with contextlib.suppress(Exception):
                     await self.asr.finalize()
+                marks.exit("asr_finalize")
+                marks.enter("asr_final")
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         utterance.event.wait(), timeout=self._final_timeout
                     )
-            asr_final_ms = marks.exit("asr_final")
+                asr_final_ms = marks.exit("asr_final")
+            else:
+                asr_final_ms = None
 
             text = (utterance.final or utterance.latest).strip()
             source = "final" if utterance.final else ("partial" if utterance.latest else "none")
@@ -454,16 +550,24 @@ class UtteranceLoop:
                     self._final_timeout,
                     len(text),
                 )
-            self._pending.pop(utterance.index - 1, None)
-            if self.current is utterance:
-                self.current = None
 
             await self._dump(utterance, text, source, asr_final_ms)
 
             if not text:
-                if session.state != SessionState.ERROR:
+                if self.current is utterance and session.state != SessionState.ERROR:
                     session.notice("I didn't catch that. Try again, or type it.", "info")
                     session.set_state(SessionState.LISTENING)
+                return
+
+            if utterance.superseded:
+                # The visitor is already asking the next question. Dumping the
+                # transcript keeps it recoverable; publishing it or running a
+                # turn would put the previous answer on top of them.
+                log.info(
+                    "dropping superseded transcript for utterance %d (%d chars)",
+                    utterance.index,
+                    len(text),
+                )
                 return
 
             session.publish(
@@ -475,8 +579,13 @@ class UtteranceLoop:
             )
             session.turn_task = task
         finally:
-            self._finalizing = False
-            self._final_task = None
+            # Unconditional: a cancelled finalize must not leave the utterance
+            # in ``_open`` / ``_by_provider``, where a late provider event could
+            # still be routed to a turn that will never run.
+            self._close_utterance(utterance)
+            if self._final_task is asyncio.current_task():
+                self._finalizing = False
+                self._final_task = None
 
     # ------------------------------------------------------------------- dump
 
@@ -493,6 +602,7 @@ class UtteranceLoop:
         index = utterance.index
         payload = {
             "utterance": index,
+            "provider_index": utterance.provider_index,
             "text": text,
             "source": source,
             "partial": utterance.latest,
@@ -534,5 +644,15 @@ class UtteranceLoop:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._final_task
             self._final_task = None
+        if self._note_task is not None:
+            self._note_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._note_task
+            self._note_task = None
+        if self._rewarm_task is not None:
+            self._rewarm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._rewarm_task
+            self._rewarm_task = None
         await self._close_asr()
         self.vad.reset()

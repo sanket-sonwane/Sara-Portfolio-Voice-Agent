@@ -180,6 +180,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         stages = _config_payload(resolved)
         stages["kb_blocks"] = len(kb.blocks)
         stages["ready"] = orchestrator.ready
+        stages["vad"] = f"{orchestrator.detector}/{orchestrator.detector_silence_ms}ms"
         return HealthResponse(
             ok=orchestrator.ready,
             version=__version__,
@@ -218,7 +219,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with contextlib.suppress(Exception):
                 await session.webrtc.close()
         webrtc = WebRTCSession(orchestrator, session)
-        answer = await webrtc.handle_offer(request.sdp, request.type)
+        try:
+            answer = await webrtc.handle_offer(request.sdp, request.type)
+        except Exception as error:  # noqa: BLE001 - a bad offer is a client error
+            # A malformed SDP used to escape as an unhandled ValueError (and
+            # leak the peer connection). It is a 400, and the half-built
+            # session is closed before we answer.
+            with contextlib.suppress(Exception):
+                await webrtc.close()
+            raise HTTPException(status_code=400, detail="invalid WebRTC offer") from error
         session.webrtc = webrtc
         session.ever_connected = True
         return OfferResponse(sdp=answer["sdp"], type=answer["type"])
@@ -388,8 +397,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         async def sender() -> None:
             while not session.closed:
+                generation = session.generation
                 frame = await session.egress.next_frame()
                 await websocket.send_bytes(frame_bytes(frame))
+                marks = session.marks.get(generation)
+                if (
+                    marks is not None
+                    and marks.first_audio is not None
+                    and marks.transport_first_frame is None
+                ):
+                    # The first frame the egress selected has now actually left
+                    # the process. It is still not "audible" - that stamp belongs
+                    # to the browser - but it is a distinct, honest event.
+                    marks.mark_transport_first_frame()
 
         send_task = asyncio.create_task(sender())
         try:

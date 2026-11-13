@@ -1,11 +1,14 @@
 """Latency instrumentation.
 
-Every stage records a monotonic timestamp at entry and exit, relative to the
-turn's origin. The origin is the moment end-of-speech was detected, because that
-is what the product promises: end-of-speech to first audio.
+Every stage records a monotonic timestamp at entry and exit. For a voice turn
+the origin is the **last speech frame** the detector heard, because that is the
+start of what the visitor waits through. For a text turn it is the request.
+``timeline()`` puts every stage on that one axis, which is the view a report
+should read: endpoint, ASR, model, TTS and egress as disjoint segments rather
+than numbers measured on different clocks.
 
 Marks are kept per turn and aggregated in a ring buffer, so the diagnostics
-overlay can show p50/p95 without a metrics backend.
+overlay can show p50/p90/p95 without a metrics backend.
 """
 
 from __future__ import annotations
@@ -46,7 +49,13 @@ class TurnMarks:
     cancelled: bool = False
     filler_used: bool = False
     source: str = ""
+    # Three different events that used to share one name:
+    #   tts_first_span       - first synthesized PCM received from the provider
+    #   first_audio          - first frame the egress selected for transmission
+    #   transport_first_frame- first frame actually written to the transport
+    tts_first_span: float | None = None
     answer_first_audio: float | None = None
+    transport_first_frame: float | None = None
 
     def enter(self, stage: str) -> None:
         self.stage_enter[stage] = now()
@@ -73,27 +82,47 @@ class TurnMarks:
             self.first_audio = now()
         return (self.first_audio - self.origin) * 1000.0
 
-    def mark_end_of_speech(self) -> None:
-        self.end_of_speech = now()
+    def mark_end_of_speech(self, at: float | None = None) -> None:
+        """Stamp the last speech frame, not the moment the window expired.
+
+        The turn origin for a voice turn is the *last frame the detector heard
+        as speech*. Everything the visitor waits through - the endpoint window,
+        ASR finalisation, retrieval, the model, TTS, egress - is measured from
+        there, so ``first_audio_ms`` is the honest last-speech-to-audible number
+        and ``endpoint`` is not double-counted.
+        """
+        self.end_of_speech = at if at is not None else now()
 
     def mark_endpoint(self, duration_ms: float) -> None:
         """Record the silence window observed before the turn was declared over.
 
-        Endpointing finishes *before* this marks object exists - the turn
-        engine only sees the text after ``transcript.final`` - so the stage is
-        written back-dated: it opened ``duration_ms`` before the origin and
-        closed at the origin. Without it the largest single term in the
-        latency budget (the configured silence window, as actually observed on
-        the wire) is invisible in ``/api/metrics``.
+        The window starts at the last speech frame (the turn origin) and ends
+        when the detector declared the turn over, so it is written forward from
+        the origin rather than back-dated from it. Keeping both on the same
+        axis is what stops an endpoint delay from being reported as ASR latency.
         """
         if duration_ms <= 0:
             return
-        self.stage_enter["endpoint"] = self.origin - duration_ms / 1000.0
-        self.stage_exit["endpoint"] = self.origin
+        self.stage_enter["endpoint"] = self.origin
+        self.stage_exit["endpoint"] = self.origin + duration_ms / 1000.0
 
     def offsets(self) -> dict[str, float]:
         return {
             stage: round((stamp - self.origin) * 1000.0, 1)
+            for stage, stamp in self.stage_exit.items()
+        }
+
+    def timeline(self) -> dict[str, float]:
+        """Every stage exit on one axis: milliseconds since the last speech frame.
+
+        This is the view a latency report should read. ``offsets()`` is relative
+        to the turn origin, which for a text turn is the request; for a voice
+        turn the origin *is* the last speech frame, so the two coincide.
+        """
+        if self.end_of_speech is None:
+            return self.offsets()
+        return {
+            stage: round((stamp - self.end_of_speech) * 1000.0, 1)
             for stage, stamp in self.stage_exit.items()
         }
 
@@ -109,15 +138,40 @@ class TurnMarks:
             "turn_id": self.turn_id,
             "durations_ms": self.durations(),
             "offsets_ms": self.offsets(),
+            "timeline_ms": self.timeline(),
             "cancelled": self.cancelled,
             "filler_used": self.filler_used,
             "source": self.source,
         }
-        if self.first_audio is not None:
-            payload["first_audio_ms"] = round(self.mark_first_audio(), 1)
+        if self.tts_first_span is not None:
+            payload["tts_first_span_ms"] = round(
+                (self.tts_first_span - self.origin) * 1000.0, 1
+            )
             if self.end_of_speech is not None:
-                payload["eos_to_first_audio_ms"] = round(
+                payload["eos_to_tts_first_span_ms"] = round(
+                    (self.tts_first_span - self.end_of_speech) * 1000.0, 1
+                )
+        if self.first_audio is not None:
+            payload["egress_first_frame_ms"] = round(
+                (self.first_audio - self.origin) * 1000.0, 1
+            )
+            if self.end_of_speech is not None:
+                payload["eos_to_egress_first_frame_ms"] = round(
                     (self.first_audio - self.end_of_speech) * 1000.0, 1
+                )
+            # Deprecated names, kept for one release so stored results and the
+            # existing diagnostics overlay stay readable. They mean "first
+            # frame the egress selected", not "the visitor heard it".
+            payload["first_audio_ms"] = payload["egress_first_frame_ms"]
+            if self.end_of_speech is not None:
+                payload["eos_to_first_audio_ms"] = payload["eos_to_egress_first_frame_ms"]
+        if self.transport_first_frame is not None:
+            payload["transport_first_frame_ms"] = round(
+                (self.transport_first_frame - self.origin) * 1000.0, 1
+            )
+            if self.end_of_speech is not None:
+                payload["eos_to_transport_first_frame_ms"] = round(
+                    (self.transport_first_frame - self.end_of_speech) * 1000.0, 1
                 )
         if self.answer_first_audio is not None:
             payload["answer_first_audio_ms"] = round(
@@ -129,9 +183,20 @@ class TurnMarks:
                 )
         return payload
 
+    def mark_tts_first_span(self) -> None:
+        if self.tts_first_span is None:
+            self.tts_first_span = now()
+        # ``answer_first_audio`` used to be stamped here by the emitter; keep
+        # the alias pointing at the same event, named for what it is.
+        self.mark_answer_first_audio()
+
     def mark_answer_first_audio(self) -> None:
         if self.answer_first_audio is None:
-            self.answer_first_audio = now()
+            self.answer_first_audio = self.tts_first_span or now()
+
+    def mark_transport_first_frame(self) -> None:
+        if self.transport_first_frame is None:
+            self.transport_first_frame = now()
 
 
 # `tts_ttfa` and `egress` split one provider-side wait, and the split is not
@@ -143,6 +208,7 @@ class TurnMarks:
 # experiences is the sum, "TTS request -> first audible sample".
 STAGE_ORDER = (
     "endpoint",
+    "asr_finalize",
     "asr_final",
     "lookup",
     "context",
@@ -153,6 +219,9 @@ STAGE_ORDER = (
     "tts_total",
     "egress",
     "first_audio",
+    "egress_first_frame",
+    "transport_first_frame",
+    "tts_first_span",
     "answer_first_audio",
 )
 
@@ -173,6 +242,11 @@ class MetricsStore:
         first_audio = payload.get("first_audio_ms")
         if isinstance(first_audio, (int, float)) and first_audio > 0:
             self.samples["first_audio"].append(float(first_audio))
+        for key in ("egress_first_frame_ms", "transport_first_frame_ms", "tts_first_span_ms"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                stage = key.removesuffix("_ms")
+                self.samples[stage].append(float(value))
         answer_first_audio = payload.get("answer_first_audio_ms")
         if isinstance(answer_first_audio, (int, float)) and answer_first_audio > 0:
             self.samples["answer_first_audio"].append(float(answer_first_audio))
@@ -188,6 +262,7 @@ class MetricsStore:
             stages[stage] = {
                 "n": len(data),
                 "p50": round(percentile(data, 50), 1),
+                "p90": round(percentile(data, 90), 1),
                 "p95": round(percentile(data, 95), 1),
                 "mean": round(statistics.fmean(data), 1),
                 "max": round(max(data), 1),

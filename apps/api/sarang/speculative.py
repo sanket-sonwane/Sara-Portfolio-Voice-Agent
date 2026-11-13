@@ -74,20 +74,31 @@ class Speculator:
         *,
         enabled: bool = True,
         min_words: int = 4,
-        stable_hits: int = 1,
+        stable_hits: int = 2,
+        min_age_ms: int = 180,
         armer: Callable[[Speculation], Awaitable[bool]] | None = None,
-        max_arms: int = 60,
+        max_arms: int = 12,
+        max_arms_per_turn: int = 3,
     ) -> None:
         self.enabled = enabled
         self.min_words = min_words
         self.stable_hits = stable_hits
+        # A hypothesis that has been on screen for less than this is still
+        # moving; arming it spends a provider stream on a guess the recogniser
+        # is about to rewrite.
+        self.min_age_ms = min_age_ms
         self.armer = armer
         # Cost ceiling. Every arm is a full provider stream, and a session
         # that arms and never adopts is paying for nothing; the cap bounds
-        # that waste per session instead of trusting good behaviour.
+        # that waste per session instead of trusting good behaviour. The
+        # per-turn cap is the tighter one: a single utterance should not burn
+        # a dozen streams as its partial churns.
         self.max_arms = max_arms
+        self.max_arms_per_turn = max_arms_per_turn
         self._last_text = ""
         self._hits = 0
+        self._first_seen_at = 0.0
+        self._arms_this_turn = 0
         self._candidate: Speculation | None = None
         self._lock = asyncio.Lock()
         self.prepared = 0
@@ -101,6 +112,8 @@ class Speculator:
         """Drop the current hypothesis and stop paying for its arm."""
         self._last_text = ""
         self._hits = 0
+        self._first_seen_at = 0.0
+        self._arms_this_turn = 0
         candidate, self._candidate = self._candidate, None
         if candidate is not None:
             self.discard(candidate)
@@ -112,20 +125,28 @@ class Speculator:
         if len(text.split()) < self.min_words:
             self._last_text = text
             self._hits = 0
+            self._first_seen_at = 0.0
             return None
         if text == self._last_text:
             self._hits += 1
         else:
             self._last_text = text
             self._hits = 1
+            self._first_seen_at = time.perf_counter()
             # The hypothesis moved on: whatever was armed for the old text
             # can no longer be adopted for this one, so stop paying for it.
             previous, self._candidate = self._candidate, None
             if previous is not None:
                 self.discard(previous)
-        # Arm as soon as we have a usable hypothesis; identical repeats are
-        # deduped below so we don't re-arm the same text.
+        # Stability is two independent conditions: the same text must be seen
+        # ``stable_hits`` times *and* must have been on screen for a moment.
+        # With the old ``stable_hits=1`` the first eligible partial armed
+        # immediately, so every recogniser revision bought a full stream.
         if self._hits < self.stable_hits:
+            return None
+        if self.min_age_ms and (
+            time.perf_counter() - self._first_seen_at < self.min_age_ms / 1000.0
+        ):
             return None
         if self._candidate is not None and self._candidate.text == text:
             return self._candidate
@@ -149,8 +170,10 @@ class Speculator:
             if (
                 self.armer is not None
                 and self.armed < self.max_arms
+                and self._arms_this_turn < self.max_arms_per_turn
                 and result.confident
             ):
+                self._arms_this_turn += 1
                 spec.arm_task = asyncio.create_task(self._run_armer(spec))
             return spec
 

@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 
 import * as api from "./api";
+import { clientEosToAudible } from "./metrics";
 import {
   PcmSocket,
   Playback,
@@ -260,6 +261,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
   const reconnectAttemptsRef = useRef(0);
   const lastBargeRef = useRef(0);
   const speechCandidateRef = useRef(0);
+  const overloadNoticeAtRef = useRef(0);
   // Visitor-experienced latency, both stamps on the performance.now() clock so
   // no server/client clock sync is needed. `eosAt` is when this client saw the
   // server leave `user_speaking`; `audibleAt` is when the first answer chunk of
@@ -694,10 +696,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
           // Only meaningful when both stamps belong to the same turn and the
           // answer came after the end of speech. Anything else is a text turn,
           // a barge-in, or a greeting, and must not invent a number.
-          const clientMs =
-            eos !== null && audible !== null && audible >= eos
-              ? Math.round(audible - eos)
-              : undefined;
+          const clientMs = clientEosToAudible(eos, audible);
           setLastTurn({ ...turn, client_eos_to_audible_ms: clientMs });
           if (turn.eos_to_answer_audio_ms !== undefined || clientMs !== undefined) {
             setTurnLog((previous) => [
@@ -863,20 +862,31 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
     bargeTimerRef.current = window.setInterval(() => {
       const mic = micRef.current;
       if (!mic || mutedRef.current || !wantMicRef.current) return;
-      let level = 0;
-      try {
-        level = rms(mic.analyser);
-      } catch {
-        return;
-      }
+      const level = (() => {
+        try {
+          return rms(mic.analyser);
+        } catch {
+          return 0;
+        }
+      })();
       if (level < 0.02) {
         noiseFloorRef.current = noiseFloorRef.current * 0.97 + level * 0.03;
       }
       const threshold = Math.max(0.045, noiseFloorRef.current * 4);
-      const inResponse = ["speaking", "processing", "tool"].includes(viewRef.current);
+      // Playback is the ground truth: the server may already be "listening"
+      // while the browser still has the tail of the answer scheduled. Watching
+      // the queue as well as the view state is what keeps a late barge-in from
+      // being ignored.
+      const inResponse =
+        ["speaking", "processing", "tool"].includes(viewRef.current) ||
+        playbackRef.current?.active === true;
       if (inResponse && level > threshold) {
         if (!speechCandidateRef.current) speechCandidateRef.current = performance.now();
-        if (performance.now() - speechCandidateRef.current > 160 && performance.now() - lastBargeRef.current > 700) {
+        // 120 ms of sustained level, checked every 30 ms: detection costs
+        // 120-150 ms instead of 160-205 ms. The server VAD (Silero) fires on
+        // its own at about 128 ms of speech, so either path can win; this one
+        // is what stops playback before the round trip finishes.
+        if (performance.now() - speechCandidateRef.current > 120 && performance.now() - lastBargeRef.current > 700) {
           speechCandidateRef.current = 0;
           lastBargeRef.current = performance.now();
           interrupt("barge-in");
@@ -884,7 +894,7 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
       } else {
         speechCandidateRef.current = 0;
       }
-    }, 45);
+    }, 30);
   }, [interrupt]);
 
   const startPcm = useCallback(
@@ -918,6 +928,17 @@ export function useSarang(remoteAudio: RefObject<HTMLAudioElement | null>): UseS
               setViewState("connected", "Connected");
             }
             startBargeWatch();
+          },
+          onOverload: (queuedMs) => {
+            // Dropping audio is better than transcribing yesterday's speech,
+            // but the visitor still deserves to know the uplink is behind.
+            const now = performance.now();
+            if (now - overloadNoticeAtRef.current < 5_000) return;
+            overloadNoticeAtRef.current = now;
+            pushNotice(
+              `Your connection is behind live audio (${Math.round(queuedMs)} ms queued); some microphone audio was dropped.`,
+              "warning",
+            );
           },
           onClose: () => {
             if (lifespan !== lifespanRef.current || endedRef.current) return;

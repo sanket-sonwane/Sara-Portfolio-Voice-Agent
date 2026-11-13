@@ -252,6 +252,18 @@ export class Playback {
     return !this.closed && this.context.state === "running";
   }
 
+  /**
+   * True while audio for the current run is still scheduled or playing.
+   *
+   * Barge-in detection must key off this, not off the UI state: the server can
+   * legitimately report "listening" once it has handed the last frame to the
+   * transport while the browser still has hundreds of milliseconds queued.
+   */
+  get active(): boolean {
+    if (this.closed) return false;
+    return this.sources.size > 0 || this.playhead > this.context.currentTime;
+  }
+
   /** `performance.now()` at which the current run of audio becomes audible. */
   get audibleFrom(): number | null {
     return this.audibleAt;
@@ -360,16 +372,41 @@ export interface PcmSocketHandlers {
   onClose?: (event: CloseEvent) => void;
   onError?: (error: Event) => void;
   onAudio: (pcm: Int16Array) => void;
+  /** Called when the send queue is over the real-time budget and frames are dropped. */
+  onOverload?: (queuedMs: number, droppedMs: number) => void;
 }
 
 export class PcmSocket {
   private socket: WebSocket | null = null;
   private closed = false;
+  // Real-time audio must never accumulate an unbounded backlog: a slow uplink
+  // would deliver yesterday's speech to a recogniser that is already answering
+  // it. Frames are dropped (newest first) once the socket's own buffer holds
+  // more than this much audio, and the UI is told.
+  private readonly bytesPerMs: number;
+  private readonly maxQueueBytes: number;
+  private queuedMs = 0;
+  private droppedBytes = 0;
 
   constructor(
     private readonly url: string,
     private readonly handlers: PcmSocketHandlers,
-  ) {}
+    options: { bytesPerMs?: number; maxQueueMs?: number } = {},
+  ) {
+    // 16 kHz mono PCM16 is 32 bytes/ms; the default matches the browser's
+    // native capture path (48 kHz => 96 bytes/ms).
+    this.bytesPerMs = options.bytesPerMs ?? 96;
+    this.maxQueueBytes = Math.round(this.bytesPerMs * (options.maxQueueMs ?? 500));
+  }
+
+  /** Milliseconds of microphone audio currently waiting in the socket. */
+  get backlogMs(): number {
+    return this.queuedMs;
+  }
+
+  get droppedMs(): number {
+    return this.droppedBytes / this.bytesPerMs;
+  }
 
   open(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -377,6 +414,8 @@ export class PcmSocket {
       socket.binaryType = "arraybuffer";
       this.socket = socket;
       let settled = false;
+      this.droppedBytes = 0;
+      this.queuedMs = 0;
 
       const settle = (error?: Error) => {
         if (settled) return;
@@ -410,6 +449,15 @@ export class PcmSocket {
   send(pcm: Int16Array): void {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN || !pcm.length) return;
+    // `bufferedAmount` is the browser's unsent queue. Convert it to audio time,
+    // not bytes: the budget is "no more than 500 ms behind live speech".
+    const buffered = Math.max(0, socket.bufferedAmount || 0) + pcm.byteLength;
+    this.queuedMs = buffered / this.bytesPerMs;
+    if (buffered > this.maxQueueBytes) {
+      this.droppedBytes += pcm.byteLength;
+      this.handlers.onOverload?.(this.queuedMs, this.droppedMs);
+      return;
+    }
     socket.send(pcm.buffer);
   }
 

@@ -6,7 +6,11 @@
  * and has no knowledge of the server protocol.
  */
 class SarangPcmProcessor extends AudioWorkletProcessor {
-  process(inputs: Float32Array[][]): boolean {
+  // Plain JavaScript on purpose: this file is loaded by audioWorklet.addModule()
+  // directly, not compiled. A type annotation here is a parse error in the
+  // worklet scope, which used to make addModule() reject and silently drop the
+  // whole pipeline onto the deprecated ScriptProcessorNode fallback.
+  process(inputs) {
     const channel = inputs[0]?.[0];
     if (channel && channel.length) {
       this.port.postMessage(channel.slice(0));

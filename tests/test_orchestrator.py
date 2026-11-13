@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from sarang.orchestrator import filler_voice_tag
 from sarang.schemas import Envelope
@@ -220,3 +221,90 @@ async def test_question_set_never_returns_empty_answers(orchestrator, session, q
     events = await collect(queue, "assistant.final")
     text = [event for event in events if event.type.value == "assistant.final"][0].payload["text"]
     assert len(text.strip()) > 10
+
+
+# ------------------------------------------------------- playback lifecycle
+
+
+async def test_state_stays_speaking_until_the_egress_drains(orchestrator, session):
+    """Synthesis finishing is not playback finishing."""
+    from sarang.audio.frames import FRAME_SAMPLES
+    from sarang.session import SessionState
+
+    generation = session.generation
+    session.egress.set_generation(generation)
+    session.set_state(SessionState.SPEAKING)
+    session.egress.put(
+        np.full(FRAME_SAMPLES * 2, 1_000, dtype=np.int16), generation, "trn_1"
+    )
+
+    orchestrator._watch_playback(session, generation)
+    await asyncio.sleep(0.05)
+    # Two frames are still queued in the egress; the browser is still hearing
+    # the answer, so the server must not say it is listening again.
+    assert session.state is SessionState.SPEAKING
+
+    while session.egress.pending_samples():
+        await session.egress.next_frame()
+    await asyncio.sleep(0.05)
+    assert session.state is SessionState.LISTENING
+
+
+async def test_watch_playback_does_not_resurrect_a_cancelled_generation(
+    orchestrator, session,
+):
+    from sarang.audio.frames import FRAME_SAMPLES
+    from sarang.session import SessionState
+
+    generation = session.generation
+    session.egress.set_generation(generation)
+    session.set_state(SessionState.SPEAKING)
+    session.egress.put(
+        np.full(FRAME_SAMPLES * 4, 1_000, dtype=np.int16), generation, "trn_1"
+    )
+    orchestrator._watch_playback(session, generation)
+    await asyncio.sleep(0)
+
+    # A new turn started: the old playback watcher must leave the new state
+    # alone rather than flip it to LISTENING mid-answer.
+    session.generation = generation + 1
+    session.set_state(SessionState.THINKING)
+    session.egress.interrupt(session.generation)
+    await asyncio.sleep(0.05)
+    assert session.state is SessionState.THINKING
+
+
+async def test_cancelled_turn_releases_the_lock_before_provider_cleanup(
+    orchestrator, session, monkeypatch,
+):
+    """A slow provider cancel must not keep turn_lock held.
+
+    The next utterance waits on this lock. Awaiting provider cleanup inside the
+    cancelled turn delayed the next answer by however long the provider took to
+    tear down its socket.
+    """
+    from sarang.orchestrator import OrderedSpeech
+
+    original_cancel = OrderedSpeech.cancel
+
+    async def slow_cancel(self):
+        await asyncio.sleep(0.5)
+        await original_cancel(self)
+
+    async def hang(_runtime, _text, *, source):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(OrderedSpeech, "cancel", slow_cancel)
+    monkeypatch.setattr(orchestrator, "_run_turn", hang)
+
+    task = asyncio.create_task(orchestrator.run_turn(session, "Who is Sanket?"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with session.turn_lock:
+        pass
+    assert loop.time() - started < 0.2

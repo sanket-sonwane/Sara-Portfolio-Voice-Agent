@@ -9,8 +9,10 @@ every real turn starts after silence.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
-from sarang.audio.vad import Vad, VadConfig, dbfs, zero_crossing_rate
+from sarang.audio.vad import SileroVad, Vad, VadConfig, build_vad, dbfs, zero_crossing_rate
 
 from tests.conftest import silence, tone, vocal
 
@@ -174,3 +176,126 @@ def test_speech_from_the_first_frame_still_starts():
         started = started or update.speech_started
     assert started
     assert vad.active
+
+
+# ---------------------------------------------------------------------- silero
+#
+# The neural detector is tested with an injected predictor: the model file is
+# not needed, and the contract under test is the state machine around it - not
+# the network. These are the cases the energy detector gets wrong, which is the
+# whole reason for the second implementation.
+
+
+class ScriptedPredictor:
+    def __init__(self, probability: float = 0.0) -> None:
+        self.probability = probability
+        self.windows = 0
+
+    def __call__(self, window: np.ndarray) -> float:
+        self.windows += 1
+        return self.probability
+
+
+def _silero(probability: float = 0.0, **config):
+    predictor = ScriptedPredictor(probability)
+    vad = SileroVad(VadConfig(min_speech_ms=96, silence_ms=500, **config), predict=predictor)
+    return vad, predictor
+
+
+def test_silero_hears_a_sustained_vowel():
+    """A held vowel is speech; the energy gate called it silence mid-word.
+
+    The modulation gate rejects steady sound, so a singer or a visitor holding
+    "sooo" scored as silence and the turn closed inside the word. The neural
+    detector scores the signal itself, so probability stays high.
+    """
+    vad, predictor = _silero(0.97)
+    update = None
+    for _ in range(20):  # 400 ms of an unmodulated tone
+        update = vad.push(tone(20))
+    assert update is not None and vad.active
+    assert predictor.windows > 0
+    # And it does not endpoint while the tone continues.
+    for _ in range(50):
+        assert not vad.push(tone(20)).speech_ended
+
+
+def test_silero_is_level_invariant_against_a_hum():
+    """A loud steady hum never opens a turn, however loud it is.
+
+    This is the property that lets the silence window drop: there is no
+    adaptive level to climb over, only a probability the hum cannot earn.
+    """
+    vad, _ = _silero(0.02)
+    t = np.arange(320, dtype=np.float32) / 16_000
+    hum = (np.sin(2 * np.pi * 50.0 * t) * 9_000.0).astype(np.int16)
+    for _ in range(200):
+        assert not vad.push(hum).speech_started
+    assert not vad.active
+
+
+def test_silero_starts_after_the_minimum_speech_duration():
+    vad, _ = _silero(0.9)
+    started = False
+    for _ in range(12):
+        update = vad.push(tone(20))
+        started = started or update.speech_started
+    assert started
+    assert vad.active
+
+
+def test_silero_endpoint_matches_the_configured_window():
+    """End-of-speech is the silence window, quantised to the model's 32 ms."""
+    vad, predictor = _silero(0.9)
+    for _ in range(10):
+        vad.push(tone(20))
+    assert vad.active
+    predictor.probability = 0.0
+
+    elapsed = 0
+    for _ in range(60):
+        update = vad.push(silence(20))
+        elapsed += 20
+        if update.speech_ended:
+            break
+    assert vad.active is False
+    # 500 ms of silence, measured in 32 ms windows: the window completes 16
+    # times at 512 samples each, which is 26 pushes of 20 ms audio.
+    assert 500 <= elapsed <= 560
+
+
+def test_silero_handles_the_20_ms_push_cadence():
+    """The loop pushes 320 samples; the model needs 512. No audio may be lost."""
+    vad, predictor = _silero(0.9)
+    for _ in range(16):  # 320 ms of audio
+        vad.push(tone(20))
+    # 16 * 320 = 5120 samples -> exactly 10 windows of 512.
+    assert predictor.windows == 10
+
+
+def test_build_vad_restores_the_conservative_window_without_the_model():
+    """A missing model must not silently keep a 500 ms window on the energy VAD.
+
+    The neural detector is what makes 500 ms safe; if it cannot load, the
+    detector that replaces it needs the window that was measured safe for it.
+    """
+    detector = build_vad(
+        VadConfig(silence_ms=500), mode="silero", model_path="does-not-exist.onnx"
+    )
+    assert isinstance(detector, Vad)
+    assert detector.detector == "energy"
+    assert detector.config.silence_ms == 800
+
+
+def test_build_vad_uses_the_vendored_model_by_default():
+    """The shipped model loads and returns a probability, not an exception."""
+    model = Path(__file__).resolve().parents[1] / "apps/api/sarang/audio/models/silero_vad.onnx"
+    detector = build_vad(VadConfig(silence_ms=500), mode="silero", model_path=model)
+    assert detector.detector == "silero"
+    assert detector.config.silence_ms == 500
+    # One 32 ms window of silence: the probability is low, but it is a number.
+    update = detector.push(np.zeros(512, dtype=np.int16))
+    assert update.speech is False
+    assert 0.0 <= detector.probability <= 1.0
+
+

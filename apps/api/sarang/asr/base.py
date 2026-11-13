@@ -34,13 +34,15 @@ class ASREvent:
 class ASRSession(ABC):
     name: str = "asr"
 
-    async def begin_utterance(self) -> None:
+    async def begin_utterance(self) -> bool:
         """Mark the start of a turn on a long-lived recogniser session.
 
-        Only adapters that keep one socket open across turns need this; the
-        default is a no-op so one-utterance adapters keep working.
+        Returns whether the session is actually armed. The default is a no-op
+        for one-utterance adapters, which are ready by definition. A streaming
+        adapter must return ``False`` rather than wait: this is called from the
+        microphone ingest path.
         """
-        return None
+        return True
 
     @abstractmethod
     async def push(self, pcm: bytes) -> None:

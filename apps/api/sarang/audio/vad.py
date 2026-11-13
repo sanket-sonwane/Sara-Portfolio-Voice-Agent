@@ -1,9 +1,16 @@
 """Voice activity detection and endpointing.
 
-Energy-based with an adaptive noise floor, plus two guards that keep a steady
-sound from being mistaken for speech. Deliberately dependency-free: a neural VAD
-adds 20-40 ms and a model file, and the endpointing floor (silence we must
-observe) is the dominant cost anyway.
+Two detectors share one contract (``reset`` / ``push`` / ``VadUpdate``):
+
+* ``SileroVad`` - the default. A small ONNX model scores each 32 ms window on
+  the signal itself, so it is level-invariant and needs no modulation gate.
+  It is what makes a 500 ms silence window safe (``bench/probe/vad_accuracy.py``,
+  ADR 0003 section 9).
+* ``Vad`` - the energy fallback (``VAD_MODE=energy``), kept dependency-free for
+  the bench reference arm and for the case where the model cannot load.
+
+The energy detector below is documented in its own terms because its
+limitations are the reason the neural path exists.
 
 Two properties are measured, not assumed (``bench/probe/vad_accuracy.py``):
 
@@ -34,9 +41,12 @@ configuration with a very short ``silence_ms`` from clipping soft word endings.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 
@@ -51,6 +61,9 @@ class VadConfig:
     hangover_ms: int = 140
     steady_window_ms: int = 300
     steady_max_db: float = 1.5
+    # Silero probability above which a 32 ms window counts as speech. 0.5 is
+    # the model's own default; it is a probability, not a level.
+    silero_threshold: float = 0.5
 
 
 @dataclass
@@ -88,6 +101,8 @@ def zero_crossing_rate(samples: np.ndarray) -> float:
 
 
 class Vad:
+    detector = "energy"
+
     def __init__(self, config: VadConfig | None = None) -> None:
         self.config = config or VadConfig()
         self.noise_floor = -55.0
@@ -203,3 +218,225 @@ class Vad:
         update.speech_ms = self._speech_ms
         update.silence_ms = self._silence_ms
         return update
+
+
+# --------------------------------------------------------------------- neural
+#
+# The energy detector above is kept as the fallback (``VAD_MODE=energy``) and as
+# the reference arm in ``bench/probe/vad_accuracy.py``. It has two properties
+# that no amount of tuning fixes: its threshold is an absolute level learned
+# from the room (a fan can lift it above the speaker), and it needs a
+# *modulation* gate to reject steady sound - the same gate that marks a
+# sustained vowel as silence mid-word.
+#
+# Silero VAD scores 32 ms windows on the signal itself, so it is level-
+# invariant and needs no such gate. ADR 0003 section 9 names it as the next
+# quality step and predicts exactly the outcome we need: a silence window near
+# 500 ms without clipping.
+
+SILERO_WINDOW = 512           # samples at 16 kHz; the model's fixed window
+SILERO_CONTEXT = 64           # samples of the previous window, prepended (v5)
+SILERO_WINDOW_MS = 32.0
+SILERO_MODEL_SHA256 = (
+    "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+)
+SILERO_MODEL_PATH = Path(__file__).with_name("models") / "silero_vad.onnx"
+
+log = logging.getLogger(__name__)
+
+# One ONNX session per model file, shared by every connection. The detector
+# state (``_state``, ``_context``) is per instance; the graph and its weights are
+# immutable, and ``InferenceSession.run`` is thread-safe. Without this cache each
+# WebSocket connection paid the model load again.
+_SESSIONS: dict[Path, object] = {}
+
+
+def _load_silero_session(model_path: Path):
+    import onnxruntime as ort
+
+    cached = _SESSIONS.get(model_path)
+    if cached is not None:
+        return cached
+    if not model_path.is_file():
+        raise FileNotFoundError(f"silero VAD model not found: {model_path}")
+    digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    if digest != SILERO_MODEL_SHA256:
+        raise RuntimeError(
+            f"silero VAD model hash mismatch: {digest} != {SILERO_MODEL_SHA256}"
+        )
+    options = ort.SessionOptions()
+    # One thread: the call is ~1 ms on a 32 ms window and running it inline on
+    # the event loop is cheaper than a thread hop.
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session = ort.InferenceSession(
+        str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+    )
+    _SESSIONS[model_path] = session
+    return session
+
+
+class SileroVad:
+    """Neural voice activity detection with the same contract as :class:`Vad`.
+
+    ``predict`` accepts a 512-sample int16 window and returns the probability
+    that it contains speech. Tests inject one so they never need the model.
+    """
+
+    detector = "silero"
+
+    def __init__(
+        self,
+        config: VadConfig | None = None,
+        *,
+        model_path: Path | str | None = None,
+        predict=None,
+    ) -> None:
+        self.config = config or VadConfig()
+        self.threshold = self.config.silero_threshold
+        self.active = False
+        self._remainder = np.zeros(0, dtype=np.int16)
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(SILERO_CONTEXT, dtype=np.float32)
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+        self._hangover_ms = 0.0
+        self._partial_sent = False
+        self._probability = 0.0
+        self._level = -90.0
+        if predict is None:
+            session = _load_silero_session(Path(model_path or SILERO_MODEL_PATH))
+            self._session = session
+
+            def predict(window: np.ndarray) -> float:  # noqa: F811
+                audio = window.astype(np.float32) / 32768.0
+                # v5 is trained on 512 samples *plus* the last 64 samples of
+                # the previous window; without that context the model scores
+                # real speech at 0.0.
+                model_input = np.concatenate((self._context, audio)).reshape(1, -1)
+                self._context = audio[-SILERO_CONTEXT:]
+                output, self._state = session.run(
+                    None,
+                    {
+                        "input": model_input,
+                        "state": self._state,
+                        "sr": np.array(16_000, dtype=np.int64),
+                    },
+                )
+                return float(output[0, 0])
+
+            self._predict = predict
+        else:
+            self._session = None
+            self._predict = predict
+
+    def reset(self) -> None:
+        self.active = False
+        self._remainder = np.zeros(0, dtype=np.int16)
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(SILERO_CONTEXT, dtype=np.float32)
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+        self._hangover_ms = 0.0
+        self._partial_sent = False
+        self._probability = 0.0
+
+    def push(self, samples: np.ndarray, sample_rate: int = 16_000) -> VadUpdate:
+        if sample_rate != 16_000:
+            raise ValueError("silero VAD expects 16 kHz")
+        update = VadUpdate()
+        self._level = dbfs(samples)
+        if samples.size:
+            self._remainder = np.concatenate((self._remainder, samples))
+        while self._remainder.size >= SILERO_WINDOW:
+            window = self._remainder[:SILERO_WINDOW]
+            self._remainder = self._remainder[SILERO_WINDOW:]
+            self._probability = self._predict(window)
+            self._step(update, self._probability)
+
+        update.speech = self.active
+        update.speech_ms = self._speech_ms
+        update.silence_ms = self._silence_ms
+        update.level_dbfs = self._level
+        return update
+
+    def _step(self, update: VadUpdate, probability: float) -> None:
+        positive = probability >= self.threshold
+        if not self.active:
+            if positive:
+                self._speech_ms += SILERO_WINDOW_MS
+                if self._speech_ms >= self.config.min_speech_ms:
+                    self.active = True
+                    self._silence_ms = 0.0
+                    self._hangover_ms = 0.0
+                    self._partial_sent = False
+                    update.speech_started = True
+            else:
+                # A gap before the commit restarts the run: a door slam must
+                # not accumulate into a turn.
+                self._speech_ms = 0.0
+            return
+
+        if positive:
+            self._silence_ms = 0.0
+            self._hangover_ms = 0.0
+            self._speech_ms += SILERO_WINDOW_MS
+        else:
+            self._hangover_ms += SILERO_WINDOW_MS
+            self._silence_ms += SILERO_WINDOW_MS
+
+        if not self._partial_sent and self._speech_ms >= self.config.partial_after_ms:
+            self._partial_sent = True
+            update.partial_due = True
+
+        if self._silence_ms >= max(self.config.silence_ms, self.config.hangover_ms):
+            update.speech_ended = True
+            self.active = False
+            self._speech_ms = 0.0
+            self._silence_ms = 0.0
+            self._hangover_ms = 0.0
+            self._partial_sent = False
+
+    @property
+    def probability(self) -> float:
+        return self._probability
+
+
+def build_vad(
+    config: VadConfig,
+    *,
+    mode: str = "silero",
+    model_path: Path | str | None = None,
+):
+    """Return the configured detector, degrading loudly to the energy VAD.
+
+    The silence window is only safe below 800 ms with the neural detector: the
+    measured 460 ms internal pause in the reference question is invisible to an
+    energy VAD but not to Silero. If the model cannot load we therefore do not
+    just swap detectors - we also restore the conservative window, so a missing
+    ``onnxruntime`` cannot silently truncate every question.
+    """
+    if mode == "energy":
+        return Vad(config)
+    try:
+        detector = SileroVad(config, model_path=model_path)
+    except Exception as error:  # noqa: BLE001 - a missing model must not stop the app
+        fallback = config
+        if config.silence_ms < 800:
+            log.warning(
+                "silero VAD unavailable (%s); falling back to the energy VAD and "
+                "restoring endpoint silence to 800 ms (was %d ms)",
+                error,
+                config.silence_ms,
+            )
+            fallback = replace(config, silence_ms=800)
+        else:
+            log.warning("silero VAD unavailable (%s); falling back to the energy VAD", error)
+        return Vad(fallback)
+    log.info(
+        "vad: silero (threshold %.2f, silence %d ms)",
+        config.silero_threshold,
+        config.silence_ms,
+    )
+    return detector

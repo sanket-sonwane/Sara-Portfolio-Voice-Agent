@@ -170,26 +170,49 @@ class Settings:
     cache_dir: str = ""
 
     # Behaviour
-    # Endpointing is the single biggest cause of "it talks over me": an
-    # energy VAD hears the tail of a word as silence, so a 500 ms window closes
-    # the turn mid-sentence. 800 ms is the conservative floor for accented
-    # speech; the pre-roll buffer in the utterance loop makes the extra wait
-    # invisible (no audio is lost at the start of the next utterance).
-    endpoint_silence_ms: int = 800
-    # Guarded early close: when the recogniser's partial is a stable,
-    # terminally-punctuated sentence with substantive content, close without
-    # waiting the full fallback window. A positive value is the minimum
-    # observed silence (ms); 0 means "no added timer wait" (close on strong
-    # content/stability once real silence is observed, minimal floor) for
-    # lowest latency; negative disables this path. The full silence window
-    # remains the safety fallback.
-    endpoint_early_silence_ms: int = 0
-    endpoint_min_speech_ms: int = 120
+    # Endpointing is the single biggest cause of "it talks over me". The
+    # energy VAD heard the tail of a word as silence and could also mark a
+    # sustained vowel as silence mid-word, so 800 ms was the only safe window.
+    # The neural detector scores the signal itself (`vad_mode = "silero"`), and
+    # the measured internal pause in the reference question is 460 ms, so 500
+    # is safe with a 40 ms margin (bench/probe/pause_profile.py). E2
+    # (bench/probe/vad_accuracy.py --detector silero --silence-ms 500) reports
+    # zero problem scenarios: no false starts on hum, noise, or impulses, and
+    # every level/SNR/room variant detected. If the model cannot load,
+    # ``build_vad`` restores 800 ms with the energy detector.
+    endpoint_silence_ms: int = 500
+    # Detector selection. "silero" uses the vendored ONNX model; "energy" keeps
+    # the old dependency-free detector. An unavailable model logs a warning and
+    # falls back to energy, which is why the default silence window stays 800
+    # until the operator confirms the neural path is live.
+    vad_mode: str = "silero"
+    # Silero probability above which a 32 ms window counts as speech (0..1).
+    vad_silero_threshold: float = 0.5
+    # Override the vendored model path (default: audio/models/silero_vad.onnx).
+    vad_silero_model: str = ""
+    # Content-based early close is **disabled by default** and the value is
+    # retained only so an explicit operator opt-in still parses.
+    #
+    # It was measured against the real clip (bench/probe/pause_profile.py):
+    # the question has exactly one internal pause, 460 ms, and
+    # bench/probe/endpoint_evidence.py closes the recogniser there. With
+    # ``0`` the loop closed after 120 ms of silence and dropped every frame
+    # after it, because the VAD was still ``active`` and cannot re-fire
+    # ``speech_started`` for the same utterance. Whether the tail was lost or
+    # became a second orphan turn depended only on how long the pause lasted.
+    #
+    # Negative disables. A positive value is the minimum observed silence, and
+    # is only safe together with the resume path (see the utterance loop).
+    endpoint_early_silence_ms: int = -1
+    endpoint_min_speech_ms: int = 96
     # Lower hangover reduces fallback endpoint latency; keep enough to protect
     # soft word endings. VAD speech-end requires max(silence_ms, hangover_ms).
     endpoint_hangover_ms: int = 180
     # Audio sent to the recogniser, in seconds, kept from before the VAD fires.
-    endpoint_preroll_ms: int = 800
+    # The neural detector commits after 96 ms of speech, so the ring only has to
+    # cover the commit plus the first syllable; 800 ms was sized for the energy
+    # detector's slower, more fragile onset.
+    endpoint_preroll_ms: int = 300
     # VAD sensitivity (tune for noisy/quiet rooms; defaults match ADR 0003).
     # Raising the threshold/gate rejects more noise but can miss quiet speech.
     vad_threshold_dbfs: float = -55.0
@@ -364,11 +387,14 @@ def resolve_settings(env: dict[str, str] | None = None) -> Settings:
         smallest_max_concurrency=integer("SMALLEST_MAX_CONCURRENCY", 4),
         database_url=get("DATABASE_URL"),
         cache_dir=get("SARANG_CACHE_DIR"),
-        endpoint_silence_ms=integer("ENDPOINT_SILENCE_MS", 800),
-        endpoint_early_silence_ms=integer("ENDPOINT_EARLY_SILENCE_MS", 0),
-        endpoint_min_speech_ms=integer("ENDPOINT_MIN_SPEECH_MS", 120),
+        endpoint_silence_ms=integer("ENDPOINT_SILENCE_MS", 500),
+        endpoint_early_silence_ms=integer("ENDPOINT_EARLY_SILENCE_MS", -1),
+        endpoint_min_speech_ms=integer("ENDPOINT_MIN_SPEECH_MS", 96),
         endpoint_hangover_ms=integer("ENDPOINT_HANGOVER_MS", 180),
-        endpoint_preroll_ms=integer("ENDPOINT_PREROLL_MS", 800),
+        endpoint_preroll_ms=integer("ENDPOINT_PREROLL_MS", 300),
+        vad_mode=get("VAD_MODE") or "silero",
+        vad_silero_threshold=number("VAD_SILERO_THRESHOLD", 0.5),
+        vad_silero_model=get("VAD_SILERO_MODEL"),
         vad_threshold_dbfs=number("VAD_THRESHOLD_DBFS", -55.0),
         vad_adaptive_margin_db=number("VAD_ADAPTIVE_MARGIN_DB", 9.0),
         asr_final_timeout_s=number("ASR_FINAL_TIMEOUT_S", 3.5),

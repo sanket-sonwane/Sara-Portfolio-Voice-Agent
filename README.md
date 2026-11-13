@@ -9,7 +9,11 @@ fact lookup + LLM + tools → text segmenter → streaming TTS → WebRTC audio*
 generation-scoped cancellation so a visitor can interrupt at any time.
 
 The product spec lives in [`prd.md`](./prd.md). Architectural decisions are in
-[`docs/adr/`](./docs/adr); operations are in [`docs/runbook.md`](./docs/runbook.md).
+[`docs/adr/`](./docs/adr); the component and audio-flow map with the measured
+latency budget is in [`docs/pipeline.md`](./docs/pipeline.md); the voice-pipeline
+fix pass (what changed, tests, and why 600 ms is not yet reachable) is in
+[`docs/voice-pipeline-fixes.md`](./docs/voice-pipeline-fixes.md); operations are
+in [`docs/runbook.md`](./docs/runbook.md).
 
 ## What is implemented
 

@@ -241,7 +241,9 @@ If `eos_to_answer_audio_ms` regresses:
 | Answers are generic/refusals | LLM unavailable, local answerer active | check `llm_ready`; local answers are grounded but extractive |
 | `retrieval` says `bm25-local (database unreachable)` | bad `DATABASE_URL` | fix the DSN or unset it; BM25 is fine |
 | High `wasted` / `arm_wasted` speculation | partials don't match finals, or evidence/prompt gates refuse the arm | check `/api/metrics` `speculation` (`prepared`/`adopted`/`wasted` for lookup, `armed`/`arm_adopted`/`arm_wasted` for LLM); disable with `SPECULATIVE_LLM=false` or `SPECULATION_ENABLED=false` |
-| Voice turns still wait the full silence window on clear sentences | early endpointing disabled or gated out | `ENDPOINT_EARLY_SILENCE_MS` (default 500, 0 disables) closes early only when the partial is stable and terminally-punctuated; mid-thought pauses keep the 800 ms `ENDPOINT_SILENCE_MS` floor |
+| Voice turns wait the full silence window | the neural detector did not load | the gateway logs `silero VAD unavailable` and restores `ENDPOINT_SILENCE_MS=800` automatically; check that `onnxruntime` is installed (`uv sync --extra api`) and the model hash matches |
+| Turns close mid-sentence | `ENDPOINT_SILENCE_MS` set below the speaker's pause length | the reference clip's longest internal pause is 460 ms; the default 500 leaves 40 ms of margin. Re-run `bench/probe/pause_profile.py` on your own audio before lowering it |
+| Barge-in feels late | client detection (120 ms) or provider cancellation | EPOCH is published before cleanup now; if it is still slow, check `tts` cancel latency, not the VAD |
 | `fly deploy` fails with "insufficient CPUs available … on the current host" | the `sin` host has no room for an in-place machine update | `fly deploy --strategy immediate` replaces the machine instead of updating it; the volume and secrets are untouched |
 
 ## 8. Rollback

@@ -32,6 +32,7 @@ import base64
 import contextlib
 import json
 import logging
+from collections import deque
 from collections.abc import AsyncIterator
 from urllib.parse import urlencode
 
@@ -86,6 +87,8 @@ class SarvamASR(ASRSession):
         prompt: str = "",
         open_timeout: float = 6.0,
         session_begin_timeout: float = 2.5,
+        send_timeout: float = 2.0,
+        max_queue_ms: int = 500,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -100,6 +103,7 @@ class SarvamASR(ASRSession):
         self.prompt = prompt
         self.open_timeout = open_timeout
         self.session_begin_timeout = session_begin_timeout
+        self.send_timeout = send_timeout
         self._socket = None
         self._queue: asyncio.Queue[ASREvent | None] = asyncio.Queue()
         self._reader: asyncio.Task | None = None
@@ -109,6 +113,20 @@ class SarvamASR(ASRSession):
         self._session_ready = asyncio.Event()
         self._server_config: dict = {}
         self._buffer = bytearray()
+        # Outbound audio must never block the microphone. Everything goes
+        # through one ordered queue drained by a single sender task; when the
+        # uplink cannot keep up, the *oldest* audio is dropped (real time has
+        # already moved past it) and the loss is counted.
+        self._outbox: deque[tuple[str, dict, int]] = deque()
+        self._outbox_bytes = 0
+        self._outbox_wake = asyncio.Event()
+        self._outbox_idle = asyncio.Event()
+        self._outbox_idle.set()
+        self._sender: asyncio.Task | None = None
+        self._max_outbox_bytes = max(
+            3_200, self.sample_rate * 2 * max(100, max_queue_ms) // 1000
+        )
+        self.dropped_ms = 0.0
         # Keep outbound chunks in a stable range to balance partial latency
         # and recognition stability while preserving explicit small-chunk
         # configurations used by tests/probes.
@@ -142,6 +160,16 @@ class SarvamASR(ASRSession):
         return self._socket is not None and not self._closed and not self._dead
 
     @property
+    def ready(self) -> bool:
+        """True only when the provider confirmed ``session.begin``.
+
+        A socket that is open but unarmed is not usable: sending audio into it
+        can silently drop the first word, and waiting for arming inside the
+        microphone path is what used to stall ingestion for 2.5 s.
+        """
+        return self._session_ready.is_set() and self.alive
+
+    @property
     def server_config(self) -> dict:
         return self._server_config
 
@@ -159,16 +187,24 @@ class SarvamASR(ASRSession):
         except Exception as error:  # noqa: BLE001 - surface as a typed error
             raise ASRError(f"sarvam asr connect failed: {error}") from error
         self._reader = asyncio.create_task(self._read_loop())
+        self._sender = asyncio.create_task(self._sender_loop())
         # ``session.begin`` echoes the resolved sample rate, encoding and turn
         # detection. Waiting for it is the difference between "we asked for 16
         # kHz" and "the server is decoding 16 kHz"; sending audio before the
-        # session is armed can silently drop the first word.
-        with contextlib.suppress(TimeoutError):
+        # session is armed can silently drop the first word. A connection that
+        # never arms is a failure, not a warm socket.
+        try:
             await asyncio.wait_for(
                 self._session_ready.wait(), timeout=self.session_begin_timeout
             )
-        if not self._session_ready.is_set():
-            log.warning("sarvam asr: no session.begin within %.1fs", self.session_begin_timeout)
+        except TimeoutError as error:
+            self.last_error = "session.begin timeout"
+            log.warning(
+                "sarvam asr: no session.begin within %.1fs; closing the socket",
+                self.session_begin_timeout,
+            )
+            await self.close()
+            raise ASRError("sarvam asr did not confirm session.begin") from error
 
     async def _read_loop(self) -> None:
         assert self._socket is not None
@@ -263,41 +299,104 @@ class SarvamASR(ASRSession):
 
     # ------------------------------------------------------------------ input
 
-    async def _send(self, payload: dict) -> None:
+    def _enqueue(self, payload: dict, *, audio_bytes: int = 0) -> None:
         if self._socket is None or self._closed or self._dead:
             return
-        try:
-            await self._socket.send(json.dumps(payload))
-        except Exception as error:  # noqa: BLE001 - the reader will surface the close
-            log.warning("sarvam asr send failed: %s", error)
+        if audio_bytes:
+            # Real-time audio is only useful while it is current. If the uplink
+            # is behind, drop the oldest queued block rather than growing an
+            # unbounded backlog that the recogniser will hear minutes late.
+            while (
+                self._outbox_bytes + audio_bytes > self._max_outbox_bytes
+                and self._drop_oldest_audio()
+            ):
+                pass
+            if self._outbox_bytes + audio_bytes > self._max_outbox_bytes:
+                self.dropped_ms += audio_bytes / (self.sample_rate * 2 / 1000)
+                return
+        self._outbox.append(("audio" if audio_bytes else "control", payload, audio_bytes))
+        self._outbox_bytes += audio_bytes
+        self._outbox_idle.clear()
+        self._outbox_wake.set()
 
-    async def begin_utterance(self) -> None:
-        """Arm a turn on the live socket and send ``speech_start``."""
-        if not self._session_ready.is_set():
-            with contextlib.suppress(TimeoutError):
+    def _drop_oldest_audio(self) -> bool:
+        for index, (kind, _payload, size) in enumerate(self._outbox):
+            if kind != "audio":
+                continue
+            del self._outbox[index]
+            self._outbox_bytes = max(0, self._outbox_bytes - size)
+            self.dropped_ms += size / (self.sample_rate * 2 / 1000)
+            return True
+        return False
+
+    async def _sender_loop(self) -> None:
+        """Drain the outbox in order, off the microphone path."""
+        while not self._closed:
+            if not self._outbox:
+                # Clear before the re-check: an enqueue that happens while we
+                # are between the check and the wait must not be lost.
+                self._outbox_wake.clear()
+                if not self._outbox:
+                    self._outbox_idle.set()
+                    try:
+                        await self._outbox_wake.wait()
+                    except asyncio.CancelledError:
+                        raise
+                    continue
+            self._outbox_idle.clear()
+            _kind, payload, size = self._outbox.popleft()
+            self._outbox_bytes = max(0, self._outbox_bytes - size)
+            if self._socket is None or self._dead:
+                continue
+            try:
                 await asyncio.wait_for(
-                    self._session_ready.wait(), timeout=self.session_begin_timeout
+                    self._socket.send(json.dumps(payload)), timeout=self.send_timeout
                 )
+            except TimeoutError:
+                self.last_error = "asr send timeout"
+                log.warning("sarvam asr send timed out after %.1fs", self.send_timeout)
+                self._dead = True
+                self._outbox.clear()
+                self._outbox_bytes = 0
+                break
+            except Exception as error:  # noqa: BLE001 - the reader surfaces the close
+                self.last_error = f"asr send failed: {error}"
+                log.warning("sarvam asr send failed: %s", error)
+                self._dead = True
+                self._outbox.clear()
+                self._outbox_bytes = 0
+                break
+        self._outbox_idle.set()
+
+    async def settle(self) -> None:
+        """Wait until the outbox has drained. Tests and shutdown only."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._outbox_idle.wait(), timeout=2.0)
+
+    async def begin_utterance(self) -> bool:
+        """Arm a turn on the live socket without waiting for the network."""
+        if not self.ready:
+            return False
         self._buffer.clear()
         self._speech_open = True
         if self.endpointing == "manual":
-            await self._send({"event": "speech_start"})
+            self._enqueue({"event": "speech_start"})
+        return True
 
     async def push(self, pcm: bytes) -> None:
-        if not pcm or self._socket is None or self._closed or self._dead:
-            return
-        if not self._speech_open:
+        if not pcm or not self.ready or not self._speech_open:
             return
         self._buffer.extend(pcm)
         while len(self._buffer) >= self._chunk_bytes:
             block = bytes(self._buffer[: self._chunk_bytes])
             del self._buffer[: self._chunk_bytes]
-            await self._send_audio(block)
-
-    async def _send_audio(self, block: bytes) -> None:
-        await self._send(
-            {"event": "audio_input", "audio": base64.b64encode(block).decode("ascii")}
-        )
+            self._enqueue(
+                {
+                    "event": "audio_input",
+                    "audio": base64.b64encode(block).decode("ascii"),
+                },
+                audio_bytes=len(block),
+            )
 
     async def events(self) -> AsyncIterator[ASREvent]:
         while True:
@@ -312,29 +411,43 @@ class SarvamASR(ASRSession):
 
         Sending ``flush`` as well force-finalized whatever was buffered, which
         could truncate the transcript; the spec makes ``speech_end`` sufficient.
+        This only enqueues: the sender preserves audio-before-speech_end order.
         """
-        if self._socket is None or self._closed or self._dead:
+        if not self.ready:
             return
         if self._buffer:
             block = bytes(self._buffer)
             self._buffer.clear()
-            await self._send_audio(block)
+            self._enqueue(
+                {
+                    "event": "audio_input",
+                    "audio": base64.b64encode(block).decode("ascii"),
+                },
+                audio_bytes=len(block),
+            )
         self._speech_open = False
         if self.endpointing == "manual":
-            await self._send({"event": "speech_end"})
+            self._enqueue({"event": "speech_end"})
 
     async def close(self) -> None:
         self._closed = True
+        sender, self._sender = self._sender, None
+        if sender is not None:
+            sender.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await sender
         if self._reader:
             self._reader.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._reader
             self._reader = None
-        if self._socket is not None:
+        the_socket, self._socket = self._socket, None
+        if the_socket is not None:
             with contextlib.suppress(Exception):
-                await self._socket.send(json.dumps({"event": "end"}))
+                await asyncio.wait_for(
+                    the_socket.send(json.dumps({"event": "end"})), timeout=1.0
+                )
             with contextlib.suppress(Exception):
-                await self._socket.close()
-            self._socket = None
+                await the_socket.close()
         with contextlib.suppress(Exception):
             self._queue.put_nowait(None)

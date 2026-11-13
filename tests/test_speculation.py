@@ -39,6 +39,9 @@ class FakeLLM:
 
 async def _arm(speculator: Speculator, partial: str):
     """Note a partial twice (the stability requirement) and let the arm run."""
+    # These tests are about the gates, not the clock: disable the dwell so two
+    # notes are enough. A dedicated test pins the dwell itself.
+    speculator.min_age_ms = 0
     await speculator.note(partial)
     candidate = await speculator.note(partial)
     assert candidate is not None
@@ -120,6 +123,8 @@ async def test_reset_cancels_a_running_arm_and_counts_the_waste():
     assert cancelled
     assert speculator.arm_wasted == 1
     # The next note starts from a clean slate (fresh candidate, stale arm gone).
+    # Two notes again: reset clears the hit count as well as the candidate.
+    assert await speculator.note(PARTIAL) is None
     fresh = await speculator.note(PARTIAL)
     assert fresh is not None
     assert fresh is not candidate
@@ -202,3 +207,84 @@ async def test_no_llm_means_no_arm_but_lookup_still_warms(orchestrator, session)
     # The warm lookup itself still works and is adoptable.
     adopted = speculator.consume(PARTIAL)
     assert adopted is candidate
+
+
+# ----------------------------------------------------- stability and budget
+
+
+async def test_a_single_repeat_does_not_arm():
+    """One partial is a guess; the recogniser rewrites it on the next tick."""
+    speculator = Speculator(min_age_ms=0)
+    assert await speculator.note(PARTIAL) is None
+    assert speculator.prepared == 0
+
+
+async def test_a_hypothesis_younger_than_the_dwell_does_not_arm():
+    speculator = Speculator(min_age_ms=60)
+    assert await speculator.note(PARTIAL) is None
+    # Same text, but still inside the dwell window.
+    assert await speculator.note(PARTIAL) is None
+    assert speculator.prepared == 0
+
+    await asyncio.sleep(0.07)
+    assert await speculator.note(PARTIAL) is not None
+    assert speculator.prepared == 1
+
+
+async def test_per_turn_arm_budget_bounds_provider_streams(monkeypatch):
+    import sarang.speculative as module
+    from sarang.kb.lookup import LookupResult
+
+    monkeypatch.setattr(
+        module, "lookup", lambda text: LookupResult(query=text, confident=True)
+    )
+
+    armed: list[str] = []
+
+    async def armer(spec) -> bool:
+        armed.append(spec.text)
+        return True
+
+    speculator = Speculator(
+        armer=armer,
+        stable_hits=1,
+        min_age_ms=0,
+        max_arms_per_turn=1,
+    )
+    await speculator.note("what projects did he build")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(armed) == 1
+
+    # The partial moved on to a second question in the same turn. The lookup
+    # still warms (it is cheap), but no second provider stream is started.
+    await speculator.note("what did he ship at arai")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(armed) == 1
+    assert speculator.prepared == 2
+
+
+async def test_reset_reopens_the_per_turn_arm_budget(monkeypatch):
+    import sarang.speculative as module
+    from sarang.kb.lookup import LookupResult
+
+    monkeypatch.setattr(
+        module, "lookup", lambda text: LookupResult(query=text, confident=True)
+    )
+
+    armed: list[int] = []
+
+    async def armer(_spec) -> bool:
+        armed.append(len(armed))
+        return True
+
+    speculator = Speculator(
+        armer=armer, stable_hits=1, min_age_ms=0, max_arms_per_turn=1
+    )
+    for _ in range(2):
+        await speculator.note(PARTIAL)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        speculator.reset()
+    assert len(armed) == 2

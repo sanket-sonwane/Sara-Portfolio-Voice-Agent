@@ -74,6 +74,10 @@ class AudioEgress:
         self._flush_guard_s = flush_guard_ms / 1000.0
         self._deadline: float | None = None
         self._first_audio_sent: set[int] = set()
+        # One drained signal per generation: "every sample this generation will
+        # produce has been handed to the transport". The turn lifecycle uses it
+        # to stay SPEAKING until the answer is actually over.
+        self._drained: dict[int, asyncio.Event] = {}
         self.on_first_audio = None  # optional callback(generation)
         self.underruns = 0
         self.dropped = 0
@@ -91,6 +95,36 @@ class AudioEgress:
         self._residual = np.zeros(0, dtype=np.int16)
         self._flush_guard_until = time.perf_counter() + self._flush_guard_s
         self._deadline = None
+        # Release anybody waiting for the old generation to finish playing: it
+        # is not going to finish, and the new turn must not wait for it.
+        for event in self._drained.values():
+            event.set()
+
+    def _drain_event(self, generation: int) -> asyncio.Event:
+        event = self._drained.get(generation)
+        if event is None:
+            event = asyncio.Event()
+            self._drained[generation] = event
+        return event
+
+    async def wait_drained(self, generation: int, timeout: float = 30.0) -> bool:
+        """Wait until this generation has no audio left to hand to the wire.
+
+        This is transport-level completion, not speaker-level: the browser
+        still has its own buffer. It is the signal the turn lifecycle needs to
+        stop calling itself ``speaking``, and it deliberately releases early on
+        an interrupt (the old generation is cancelled, not played out).
+        """
+        if generation != self.generation or (
+            not self._chunks and len(self._residual) < FRAME_SAMPLES
+        ):
+            return True
+        event = self._drain_event(generation)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
 
     # -------------------------------------------------------------------- input
 
@@ -99,6 +133,9 @@ class AudioEgress:
             self.dropped += 1
             return False
         if pcm.size:
+            # New audio arrived for this generation: playback is no longer
+            # complete.
+            self._drain_event(generation).clear()
             if generation not in self._first_audio_sent:
                 # Nothing of this generation has been heard yet, so leading
                 # silence is dead air in front of the answer, not a pause
@@ -164,6 +201,16 @@ class AudioEgress:
                             self.on_first_audio(generation)
 
             now = time.perf_counter()
+            # Completion is decided on what is still queued *after* this frame:
+            # no whole frames left in the residual and nothing in the chunk
+            # queue means the transport has everything this turn will play.
+            if (
+                generation in self._first_audio_sent
+                and not self._chunks
+                and len(self._residual) < FRAME_SAMPLES
+            ):
+                self._drain_event(generation).set()
+
             if self._deadline is None:
                 # Nothing has been paced yet, so there is no previous frame to
                 # keep a 20 ms cadence from. Send immediately and start the

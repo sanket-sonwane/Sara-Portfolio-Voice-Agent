@@ -48,20 +48,38 @@ def test_percentile_matches_nearest_rank_expectations():
     assert percentile([1.0, 2.0, 3.0], 50) == 2.0
 
 
-def test_mark_endpoint_backdates_the_silence_window():
-    """Endpointing finishes before the marks object exists; the stage is written back.
+def test_mark_endpoint_opens_at_the_turn_origin():
+    """The silence window is the first segment of the turn, not a back-dated one.
 
-    Without this the configured silence window - the single biggest term in
-    the budget - never appears in /api/metrics, and every later claim about
-    endpointing is inferred from config instead of measured.
+    Origin is the last speech frame, so the endpoint stage starts there and
+    ends when the detector declared the turn over. Everything after it (ASR,
+    model, TTS, egress) then reads as disjoint time on one axis; before this,
+    the window was charged to whichever stage happened to be measured next.
     """
-    marks = TurnMarks("trn_1")
+    origin = 100.0
+    marks = TurnMarks("trn_1", origin=origin)
 
     marks.mark_endpoint(812.0)
 
     assert round(marks.durations()["endpoint"], 1) == 812.0
-    # The stage closes where the turn begins: origin is speech end.
-    assert marks.stage_exit["endpoint"] == marks.origin
+    assert marks.stage_enter["endpoint"] == origin
+    assert marks.stage_exit["endpoint"] == origin + 0.812
+
+
+def test_timeline_places_every_stage_after_the_last_speech_frame():
+    marks = TurnMarks("trn_1", origin=100.0)
+    marks.mark_end_of_speech(100.0)
+    marks.mark_endpoint(500.0)
+    marks.enter("asr_final")
+    marks.stage_enter["asr_final"] = 100.5
+    marks.stage_exit["asr_final"] = 100.8
+
+    timeline = marks.timeline()
+
+    assert timeline["endpoint"] == 500.0
+    assert timeline["asr_final"] == 800.0
+    # And the payload carries it, so a report never has to recompute clocks.
+    assert marks.to_payload()["timeline_ms"]["asr_final"] == 800.0
 
 
 def test_mark_endpoint_ignores_a_missing_window():
@@ -71,3 +89,44 @@ def test_mark_endpoint_ignores_a_missing_window():
     marks.mark_endpoint(0.0)
 
     assert marks.durations() == {}
+
+
+def test_first_audio_names_are_split_and_aliased():
+    """Synthesis, egress selection and the wire are three different events.
+
+    They used to share ``first_audio``, so a fast provider looked like fast
+    playback. The payload names each event, and keeps the deprecated key for
+    one release so stored results still read.
+    """
+    marks = TurnMarks("trn_1", origin=100.0)
+    marks.mark_end_of_speech(100.0)
+    marks.mark_tts_first_span()
+    marks.tts_first_span = 100.2
+    marks.answer_first_audio = 100.2
+    marks.mark_first_audio()
+    marks.first_audio = 100.3
+    marks.mark_transport_first_frame()
+    marks.transport_first_frame = 100.4
+
+    payload = marks.to_payload()
+
+    assert payload["tts_first_span_ms"] == 200.0
+    assert payload["egress_first_frame_ms"] == 300.0
+    assert payload["transport_first_frame_ms"] == 400.0
+    # ``answer_first_audio`` keeps pointing at the provider span, named for it.
+    assert payload["answer_first_audio_ms"] == 200.0
+    # Deprecated aliases mean "egress selected the frame", not "it was heard".
+    assert payload["first_audio_ms"] == payload["egress_first_frame_ms"]
+    assert payload["eos_to_first_audio_ms"] == 300.0
+
+
+def test_transport_first_frame_is_not_reported_without_an_egress_frame():
+    marks = TurnMarks("trn_1", origin=100.0)
+    marks.mark_transport_first_frame()
+    marks.transport_first_frame = 100.0
+
+    payload = marks.to_payload()
+
+    assert payload["transport_first_frame_ms"] == 0.0
+    assert "egress_first_frame_ms" not in payload
+    assert "first_audio_ms" not in payload

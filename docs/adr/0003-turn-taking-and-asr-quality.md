@@ -217,25 +217,35 @@ adapter still honours `TTS_MAX_CONCURRENCY`.
 
 ## 8. Measured result
 
-Through the real gateway over `/ws/audio`, 2 turns on the fixture clip:
+Through the real gateway over `/ws/audio`, 3 turns on the fixture clip, with
+the neural detector at a 500 ms window (§12):
 
 | metric | value |
 |---|---|
-| transcript | correct (2/2) |
-| ASR finalise (p50) | 592 ms |
-| LLM TTFT (p50) | 418 ms |
-| TTS TTFA (p50) | 93 ms |
-| EOS → first answer audio (p50) | 1,123 ms |
+| transcript | correct (3/3) |
+| endpoint (configured / observed) | 500 / 512–560 ms |
+| ASR finalise (p50) | 349 ms |
+| LLM TTFT (p50) | 262 ms |
+| segmentation (p50) | 6 ms |
+| TTS TTFA (p50) | 202 ms |
+| egress handoff (p50) | 32 ms |
+| last speech → first audible (p50) | **1,286 ms** |
+| server EOS → first audible (p50) | 1,432 ms |
 
-ASR finalisation is now the largest single stage, which is the expected
-consequence of waiting for a real final instead of accepting a partial.
+The server number is now measured from the **last speech frame**, so it includes
+the endpoint window; the earlier table measured from the finalize task, which
+hid that window. The five stages add up to the client number:
+`560 + 340 + 171 + 20 + 187 + 38 = 1,316` (endpoint, ASR, LLM TTFT,
+segmentation, TTS, egress).
+
+ASR finalisation is the largest single stage, which is the expected consequence
+of waiting for a real final instead of accepting a partial.
 
 ## 9. Not done, deliberately
 
-* **Silero VAD.** The energy VAD is adequate once endpointing is generous, and
-  its detector is now measured rather than assumed (§10). A learned VAD would
-  let the silence window drop back towards 500 ms without clipping, and is the
-  next quality step.
+* **Silero VAD — done in §12.** The energy VAD was adequate once endpointing
+  was generous; the neural detector is what let the window drop to 500 ms
+  without clipping.
 * **REST hybrid finalizer.** Measured and rejected: 1 335 ms for a 4.16 s clip,
   and no keyterm biasing, so it transcribed `ARAI` as `ARII` where the realtime
   socket got it right. It runs on a separate concurrency pool, so the realtime
@@ -328,4 +338,43 @@ are what turn this into a rate gate.
 **Not done:** `simulated` is not worth its missing partials for ~100–200 ms of
 finalise — it would trade every visitor's live transcript for a gain smaller
 than run-to-run variance.
+
+**Re-measured after the reader fix** (`bench/probe/asr_chunk.py`, 20/40/60/100 ms
+on the reference clip): WER is 0% at every batch size, the first partial lands
+1.1–1.8 s into speech (provider-side, as above), and finalise is fastest at
+100 ms (1,799 ms vs 2,133–2,142 ms for the smaller batches). 100 ms stands.
+
+## 12. A neural detector buys the 500 ms window
+
+**Decision.** `VAD_MODE=silero` is the default. `endpoint_silence_ms=500`,
+`endpoint_min_speech_ms=96`, `endpoint_preroll_ms=300`. The energy detector is
+kept as `VAD_MODE=energy` and as the fallback if the model cannot load; in that
+case `build_vad` **restores the 800 ms window**, because 500 ms was only ever
+measured safe for the neural detector.
+
+**Why the energy gate could not simply be tuned.** It is level-relative (a fan
+raises the floor above a quiet speaker) and it needs a modulation gate to reject
+steady sound — the same gate that marks a sustained vowel as silence *mid-word*,
+which closed turns inside a word. Silero scores 32 ms windows on the signal
+itself, so it is level-invariant and needs no gate.
+
+**The gate (E2).** `bench/probe/vad_accuracy.py --detector silero --silence-ms 500
+--min-speech-ms 96` over the full scenario suite: **0 problem scenarios**. No
+false starts on hum only (−50…−30 dBFS), noise only (−55…−25), impulses, or
+8 s of continuous room noise; every level (−50…−20 dBFS), SNR (+5…+30 dB), hum,
+quiet-speech-in-room and speech-from-frame-0 case detected, with start delay
+100–160 ms and end 525–605 ms after true speech end.
+
+**Why 500 and not lower.** `bench/probe/pause_profile.py` finds exactly one
+internal pause in the reference question: **460 ms**. 500 leaves 40 ms of
+margin; 250 ms truncated the question to `"What did Sanket"` and a resumed
+segment produced `"What did Sanket Built during the ARAI internship. I"`
+(`bench/probe/endpoint_evidence.py`). Content-based early closing is therefore
+removed from the default path (`ENDPOINT_EARLY_SILENCE_MS=-1`): punctuation and
+stability are properties of the recogniser's guess, not of the speaker's intent.
+
+**Consequence for the budget.** Last speech → first audible is `endpoint + ASR
+final + LLM TTFT + TTS TTFA + egress`. At 500 ms that is 1.3 s p50; the earlier
+844 ms figure measured from the finalize task and omitted the window. A
+sub-second target now depends on ASR finalisation and TTS, not endpointing.
 

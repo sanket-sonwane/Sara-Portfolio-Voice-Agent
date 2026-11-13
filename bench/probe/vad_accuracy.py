@@ -42,7 +42,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "apps" / "api"))
 
-from sarang.audio.vad import Vad, VadConfig, dbfs, zero_crossing_rate  # noqa: E402
+from sarang.audio.vad import VadConfig, dbfs, zero_crossing_rate  # noqa: E402
 
 from bench.probe.common import AUDIO_DIR  # noqa: E402
 
@@ -98,9 +98,11 @@ def frames(samples: np.ndarray):
         yield samples[offset : offset + FRAME_SAMPLES]
 
 
-def run_vad(samples: np.ndarray, config: VadConfig) -> dict:
+def run_vad(samples: np.ndarray, config: VadConfig, detector: str = "energy") -> dict:
     """Feed a stream through the VAD and record what it decided, and when."""
-    vad = Vad(config)
+    from sarang.audio.vad import build_vad
+
+    vad = build_vad(config, mode=detector)
     started_at: float | None = None
     ended_at: float | None = None
     starts: list[float] = []
@@ -202,11 +204,13 @@ def main(args: argparse.Namespace) -> int:
         hangover_ms=args.hangover_ms,
         threshold_dbfs=args.threshold_dbfs,
         adaptive_margin_db=args.margin_db,
+        silero_threshold=args.silero_threshold,
     )
 
     print(f"speech source: {args.audio} ({speech.size / SAMPLE_RATE * 1000:.0f} ms)")
-    print(f"vad: silence={config.silence_ms} min_speech={config.min_speech_ms} "
-          f"hangover={config.hangover_ms} threshold={config.threshold_dbfs} dBFS "
+    print(f"vad: {args.detector} silence={config.silence_ms} "
+          f"min_speech={config.min_speech_ms} hangover={config.hangover_ms} "
+          f"threshold={config.threshold_dbfs} dBFS "
           f"margin={config.adaptive_margin_db} dB")
     print()
     print("Where real speech sits:")
@@ -347,7 +351,7 @@ def main(args: argparse.Namespace) -> int:
     print("-" * 66)
     failures = 0
     for name, stream, true_start, true_end in scenarios:
-        result = run_vad(stream, config)
+        result = run_vad(stream, config, args.detector)
         detected = result["start"] is not None
         if true_start is None:
             # Nothing should have been detected at all.
@@ -377,11 +381,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--audio", default=str(AUDIO_DIR / "question-16k.wav"))
+    parser.add_argument(
+        "--detector",
+        choices=("energy", "silero"),
+        default="silero",
+        help="which detector to measure; silero is the shipped default",
+    )
     parser.add_argument("--silence-ms", type=int, default=800)
     parser.add_argument("--min-speech-ms", type=int, default=120)
     parser.add_argument("--hangover-ms", type=int, default=250)
     parser.add_argument("--threshold-dbfs", type=float, default=-55.0)
     parser.add_argument("--margin-db", type=float, default=9.0)
+    parser.add_argument("--silero-threshold", type=float, default=0.5)
     parser.add_argument("--skip-discriminators", action="store_true")
     parser.add_argument("--lead-ms", type=int, default=600)
     parser.add_argument("--tail-ms", type=int, default=1200)
