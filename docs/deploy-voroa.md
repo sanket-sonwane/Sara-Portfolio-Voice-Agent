@@ -28,12 +28,26 @@ build command to configure.
 
 ### Why this step is manual
 
-Creating a service cannot be done from the MCP token. `propose
-create_service` records only a name — the repository, branch, runtime and
-Dockerfile path are chosen in the dashboard form, and the token's dashboard
-API returns 401. Everything after creation is scriptable: `set_env_vars`,
-`list_env_vars`, `redeploy`, `get_deploy_history`, `get_build_log`,
-`get_runtime_logs`, `get_service_status`, `rollback`.
+Creating a service is a proposal, and a proposal needs a person to approve it in
+the dashboard — that part is by design and is not a limitation to work around.
+Two details decide whether it is worth proposing at all:
+
+- **The repo fields only survive once GitHub is connected.** With no
+  connection, `propose create_service` keeps only `appName` and the summary says
+  so; the repository, branch, runtime and Dockerfile path are silently dropped.
+  Once `list_git_connections` returns an installation, the same call carries
+  `installationId`, `gitRepository` and the rest, and the summary echoes them.
+  So: connect GitHub first, then propose — or use the form.
+- **Five create requests per token per day.** The sixth returns `429 ... has
+  already asked to create 5 resources today`. Discarding a proposal does not
+  give the request back, because the cap counts requests, not open proposals.
+  Probe the payload shape against something other than a real create limit.
+
+The token cannot reach the dashboard API at all (`GET /api/apps` is `401`), so
+nothing here is creatable by script, approved or not. Everything *after*
+creation is scriptable: `set_env_vars`, `list_env_vars`, `redeploy`,
+`get_deploy_history`, `get_build_log`, `get_runtime_logs`,
+`get_service_status`, `rollback`.
 
 ### Without a GitHub connection
 
