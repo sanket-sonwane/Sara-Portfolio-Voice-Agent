@@ -115,6 +115,23 @@ fly machine run . --region iad -- python -m bench.probe.regions --full --label i
 
 ## Deployment
 
+The gateway is a single container that serves the API, the WebSocket audio path
+and the compiled widget. Any Docker host that injects `PORT` can run it.
+
+**Voroa (Mumbai, current target):** create a *Web Service* from this repository,
+set **Runtime → Docker (Dockerfile)** and the Dockerfile path to
+`/apps/api/Dockerfile`, then add the environment variables below and the
+`SARVAM_API_KEY`, `SMALLEST_API_KEY` and `SESSION_SECRET` secrets. Full
+step-by-step, sizing notes and verification are in
+[`docs/deploy-voroa.md`](./docs/deploy-voroa.md).
+
+```bash
+docker build -f apps/api/Dockerfile -t sarang-gateway .
+docker run -p 8000:8000 --env-file .env sarang-gateway   # PORT defaults to 8000
+```
+
+**Fly.io (previous target, kept as a fallback):**
+
 ```bash
 fly launch --no-deploy --copy-config --name sarang-gateway
 fly secrets set SESSION_SECRET=... SARVAM_API_KEY=... GEMINI_API_KEY=...

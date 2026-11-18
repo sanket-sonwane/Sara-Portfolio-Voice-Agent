@@ -5,8 +5,12 @@
 #   docker build -f apps/api/Dockerfile -t sarang-gateway .
 #
 # The final image contains no provider keys and no Node toolchain: every
-# credential is injected at runtime as a Fly secret (or compose env), and the
-# client is already compiled to static assets.
+# credential is injected at runtime as a Fly secret / Voroa environment
+# variable / compose env, and the client is already compiled to static assets.
+#
+# The listen port comes from ``PORT`` when the platform sets one (Voroa passes
+# 3000, Heroku-style hosts pass their own), and falls back to 8000 so a local
+# ``docker run -p 8000:8000`` behaves exactly as it did before.
 
 # ---------------------------------------------------------------- web build
 FROM node:22-slim AS web
@@ -53,7 +57,9 @@ USER sarang
 
 EXPOSE 8000
 
+# Both the probe and the server read the same ``PORT`` so a platform-injected
+# port cannot leave the container reporting healthy on a port nobody serves.
 HEALTHCHECK --interval=20s --timeout=3s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+    CMD python -c "import os,sys,urllib.request; p=os.environ.get('PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=2).status == 200 else 1)"
 
-CMD ["python", "-m", "sarang", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "exec python -m sarang --host 0.0.0.0 --port ${PORT:-8000}"]

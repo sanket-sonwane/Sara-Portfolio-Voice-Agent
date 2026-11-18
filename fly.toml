@@ -32,13 +32,10 @@ kill_timeout = 5
   # actually connects. Flip back to "true" once TURN_SHARED_SECRET is set.
   ENABLE_WEBRTC = "false"
   ALLOWED_ORIGINS = "https://sanket--sonwane.vercel.app"
-  # 500 ms of silence ends a turn. This is the measured safe floor: the fixture
-  # with the longest internal pause (460 ms, bench/audio/question-16k.wav) did
-  # not split across 5/5 turns, and every transcript matched the 800 ms run.
-  # The pre-roll buffer covers the speech that triggered the detector, so the
-  # window is not what protects the first word. Raise it if real traffic shows
-  # mid-sentence splits; the 800 ms numbers are in docs/voice-pipeline-fixes.md.
-  ENDPOINT_SILENCE_MS = "500"
+  # 800 ms of silence ends a turn. This was the value shipped before the
+  # 2026-11-13 rollback; the 500 ms experiment is in docs/voice-pipeline-fixes.md
+  # and stays available as a one-line change once a longer run confirms it.
+  ENDPOINT_SILENCE_MS = "800"
   LOG_LEVEL = "info"
 
 [http_service]

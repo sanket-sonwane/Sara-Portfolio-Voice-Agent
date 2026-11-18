@@ -9,10 +9,14 @@ in `docs/adr/0001-architecture-decisions.md`,
 
 | Piece | Default | Notes |
 |---|---|---|
-| Gateway | Fly app `sarang-gateway`, region `sin` | FastAPI, WebRTC + WebSocket PCM |
+| Gateway | Voroa web service, Mumbai (IN); Fly app `sarang-gateway`, region `sin` as fallback | FastAPI, WebRTC + WebSocket PCM |
 | Client | static `apps/web/dist`, served by the gateway | also embeddable as `<SarangWidget />` |
 | TURN | coturn | only needed when ICE cannot go direct |
 | Tier-2 store | pgvector Postgres | optional; BM25 is the fallback |
+
+The primary host is now Voroa's Mumbai region, which puts the gateway in the same
+country as Sarvam and Smallest. Fly `sin` remains as a fallback deployment; the
+step-by-step for Voroa is in [`deploy-voroa.md`](./deploy-voroa.md).
 
 `bom` (Mumbai) is the intended region and is not available on this Fly account;
 `sin` is the nearest substitute (ADR 0002 §4).
