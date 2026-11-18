@@ -19,11 +19,33 @@ Create the service in the Voroa dashboard (**New → Web Service**) with:
 | Instance | Free (Nano) to start — see §4 |
 
 The Dockerfile path is fixed when the service is created and cannot be changed
-from Settings. If the file moves, create a new service.
+from Settings. If the file moves, create a new service. It is resolved relative
+to the root directory, so with root `/` the path is `/apps/api/Dockerfile`.
 
 The image builds the widget (`npm ci && npm run build`), the Python runtime and
 the knowledge base into one container, so there is no second service and no
 build command to configure.
+
+### Why this step is manual
+
+Creating a service cannot be done from the MCP token. `propose
+create_service` records only a name — the repository, branch, runtime and
+Dockerfile path are chosen in the dashboard form, and the token's dashboard
+API returns 401. Everything after creation is scriptable: `set_env_vars`,
+`list_env_vars`, `redeploy`, `get_deploy_history`, `get_build_log`,
+`get_runtime_logs`, `get_service_status`, `rollback`.
+
+### Without a GitHub connection
+
+If no GitHub account is connected (`list_git_connections` is empty, so there is
+no `installationId`), use **Deploy from a Git URL instead** under the repository
+picker and enter `https://github.com/sanket-sonwane/Sara-Portfolio-Voice-Agent.git`
+with the branch. The repository is public, so no access token is needed.
+
+The one difference: a Git-URL service does not deploy when a commit is pushed,
+because the Git host tells Voroa nothing. Either connect GitHub for auto-deploy,
+or redeploy from the dashboard (or via MCP `redeploy`, or a deploy hook) after a
+push. Nothing else changes — same URL, variables, history and rollbacks.
 
 ### Port contract
 
@@ -37,6 +59,19 @@ so the same image works locally with `-p 8000:8000` and on Voroa without a
 change. `HEALTHCHECK` reads the same variable. Do not hard-code a port back into
 the Dockerfile — a container that reports healthy on a port nobody serves is the
 one failure mode Voroa cannot detect for us.
+
+### Health check
+
+With the Docker runtime, Voroa sends the health request from *inside* the
+container using the first of `node`, `python3`, `curl` or `wget` it finds in the
+image — then any status below 400 counts as ready. Our image has `python3`, so
+`/healthz` is checked for real, and this **replaces** the Dockerfile
+`HEALTHCHECK` during deploys. The `HEALTHCHECK` still earns its place for local
+`docker run`, where nothing else is watching.
+
+Two consequences worth knowing: a deploy that cannot answer `/healthz` fails
+before traffic moves (that is the point), and `EXPOSE` is ignored — Voroa routes
+to the port the process actually listens on.
 
 ## 2. Environment
 
@@ -62,6 +97,18 @@ Secrets:
 
 `DATABASE_URL` is optional; retrieval falls back to local BM25 and the free tier
 does not include a database in the hour budget below.
+
+These can be set after the service exists, with MCP `set_env_vars` (one call,
+`overwrite: true` only to replace a name that already has a value — values are
+write-only for everyone, including Voroa). They apply from the next deploy, so
+follow with `redeploy`; adding a variable does not restart the running version
+on its own.
+
+The service will boot before any of this is set: `SESSION_SECRET` falls back to
+`dev-only-secret` and each provider without a key reports `*_ready: false`
+instead of failing startup. That is convenient for a first build, and not a
+state to leave running — a session token signed with the development secret is
+forgeable by anyone who has read this repository.
 
 ## 3. Build and deploy
 
